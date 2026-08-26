@@ -1163,7 +1163,9 @@ mod test {
         assert_eq!(j["flags"], "u");
         assert_eq!(j["service"], "E2U+sip");
         assert_eq!(j["regex"], "!^.*$!sip:info@example.com!");
-        assert_eq!(j["replacement"], "");
+        // The root, not the empty string. A NAPTR replacement of "." is RFC 3403
+        // terminal — it means "stop here" — and rendering it as "" erased that.
+        assert_eq!(j["replacement"], ".");
     }
 
     #[test]

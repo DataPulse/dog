@@ -84,11 +84,57 @@ impl Labels {
 
 impl fmt::Display for Labels {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The root is a name with no segments, and its representation is a
+        // lone dot — not the empty string. Without this the loop below writes
+        // nothing, and a record whose value IS the root becomes indistinguishable
+        // from a record with no value at all.
+        //
+        // That distinction carries meaning. "example.com. MX 0 ." is RFC 7505
+        // null MX: an explicit statement that the domain accepts no mail, and
+        // therefore cannot be the source of any. Rendered as "", it reads as
+        // "no exchange value available". RFC 3403 NAPTR uses a root replacement
+        // the same way, to mean terminal.
+        if self.segments.is_empty() {
+            return write!(f, ".");
+        }
+
         for (_, segment) in &self.segments {
             write!(f, "{}.", segment)?;
         }
 
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod display_test {
+    use super::*;
+
+    /// The root is a lone dot, not the empty string.
+    ///
+    /// "example.com. MX 0 ." is RFC 7505 null MX — an explicit statement that
+    /// the domain accepts no mail and so cannot be the source of any. Rendered
+    /// as "" it became indistinguishable from a missing value, and a consumer
+    /// asking whether a domain can send mail lost an unambiguous answer.
+    #[test]
+    fn root_renders_as_dot() {
+        assert_eq!(Labels::root().to_string(), ".");
+    }
+
+    /// Labels::encode(".") skips empty segments and so yields the root.
+    #[test]
+    fn encoded_dot_is_the_root() {
+        assert_eq!(Labels::encode(".").unwrap().to_string(), ".");
+        assert_eq!(Labels::encode("").unwrap().to_string(), ".");
+    }
+
+    /// Ordinary names are unaffected: every segment still trails a dot.
+    #[test]
+    fn ordinary_names_are_unchanged() {
+        assert_eq!(Labels::encode("example.com").unwrap().to_string(), "example.com.");
+        assert_eq!(Labels::encode("a.b.c").unwrap().to_string(), "a.b.c.");
+        assert_eq!(Labels::encode("localhost").unwrap().to_string(), "localhost.");
     }
 }
 
