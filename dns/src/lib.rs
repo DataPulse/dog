@@ -41,4 +41,7 @@ pub use self::strings::Labels;
 mod wire;
 pub use self::wire::{Wire, WireError, MandatedLength};
 
+mod validate;
+pub use self::validate::Mismatch;
+
 pub mod record;

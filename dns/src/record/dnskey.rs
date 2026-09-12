@@ -31,7 +31,6 @@ impl Wire for DNSKEY {
     const NAME: &'static str = "DNSKEY";
     const RR_TYPE: u16 = 48;
 
-    #[cfg_attr(feature = "with_mutagen", ::mutagen::mutate)]
     fn read(stated_length: u16, c: &mut Cursor<&[u8]>) -> Result<Self, WireError> {
         if stated_length < 4 {
             let mandated_length = MandatedLength::AtLeast(4);
@@ -39,18 +38,18 @@ impl Wire for DNSKEY {
         }
 
         let flags = c.read_u16::<BigEndian>()?;
-        trace!("Parsed flags -> {:?}", flags);
+        trace!("Parsed flags -> {flags:?}");
 
         let protocol = c.read_u8()?;
-        trace!("Parsed protocol -> {:?}", protocol);
+        trace!("Parsed protocol -> {protocol:?}");
 
         let algorithm = c.read_u8()?;
-        trace!("Parsed algorithm -> {:?}", algorithm);
+        trace!("Parsed algorithm -> {algorithm:?}");
 
         let key_length = stated_length - 4;
         let mut public_key = vec![0_u8; usize::from(key_length)];
         c.read_exact(&mut public_key)?;
-        trace!("Parsed public key -> {:#x?}", public_key);
+        trace!("Parsed public key -> {public_key:#x?}");
 
         Ok(Self { flags, protocol, algorithm, public_key })
     }
@@ -60,26 +59,13 @@ impl DNSKEY {
 
     /// Returns the base64-encoded public key.
     pub fn base64_public_key(&self) -> String {
-        base64::encode(&self.public_key)
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&self.public_key)
     }
 
     /// Returns a human-readable name for the algorithm number, if known.
     pub fn algorithm_name(&self) -> Option<&'static str> {
-        match self.algorithm {
-            1 => Some("RSAMD5"),
-            3 => Some("DSA"),
-            5 => Some("RSASHA1"),
-            6 => Some("DSA-NSEC3-SHA1"),
-            7 => Some("RSASHA1-NSEC3-SHA1"),
-            8 => Some("RSASHA256"),
-            10 => Some("RSASHA512"),
-            12 => Some("ECC-GOST"),
-            13 => Some("ECDSAP256SHA256"),
-            14 => Some("ECDSAP384SHA384"),
-            15 => Some("ED25519"),
-            16 => Some("ED448"),
-            _ => None,
-        }
+        super::registry::dnssec_algorithm_name(self.algorithm)
     }
 }
 
@@ -98,7 +84,7 @@ mod test {
             0x99, 0xDB, 0x2C, 0xC9,  // public key (abbreviated)
         ];
 
-        assert_eq!(DNSKEY::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(DNSKEY::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    DNSKEY {
                        flags: 257,
                        protocol: 3,
@@ -116,7 +102,7 @@ mod test {
             0xAA, 0xBB,  // public key
         ];
 
-        assert_eq!(DNSKEY::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(DNSKEY::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    DNSKEY {
                        flags: 256,
                        protocol: 3,
@@ -132,7 +118,7 @@ mod test {
             0x03,        // protocol, but no algorithm
         ];
 
-        assert_eq!(DNSKEY::read(buf.len() as _, &mut Cursor::new(buf)),
+        assert_eq!(DNSKEY::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)),
                    Err(WireError::WrongRecordLength { stated_length: 3, mandated_length: MandatedLength::AtLeast(4) }));
     }
 

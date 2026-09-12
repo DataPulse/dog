@@ -1,0 +1,18 @@
+[package]
+name = "test-support"
+version = "0.0.0"
+description = "Test-only helpers for dog: real captured fixtures, wire mutations, loopback mock servers"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+native-tls = { version = "0.2", optional = true }
+pretty_assertions.workspace = true
+
+[features]
+default = []
+tls = ["dep:native-tls"]

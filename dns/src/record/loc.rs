@@ -78,10 +78,9 @@ impl Wire for LOC {
     const NAME: &'static str = "LOC";
     const RR_TYPE: u16 = 29;
 
-    #[cfg_attr(feature = "with_mutagen", ::mutagen::mutate)]
     fn read(stated_length: u16, c: &mut Cursor<&[u8]>) -> Result<Self, WireError> {
         let version = c.read_u8()?;
-        trace!("Parsed version -> {:?}", version);
+        trace!("Parsed version -> {version:?}");
 
         if version != 0 {
             return Err(WireError::WrongVersion {
@@ -97,25 +96,25 @@ impl Wire for LOC {
 
         let size_bits = c.read_u8()?;
         let size = Size::from_u8(size_bits);
-        trace!("Parsed size -> {:#08b} ({})", size_bits, size);
+        trace!("Parsed size -> {size_bits:#08b} ({size})");
 
         let horizontal_precision = c.read_u8()?;
-        trace!("Parsed horizontal precision -> {:?}", horizontal_precision);
+        trace!("Parsed horizontal precision -> {horizontal_precision:?}");
 
         let vertical_precision = c.read_u8()?;
-        trace!("Parsed vertical precision -> {:?}", vertical_precision);
+        trace!("Parsed vertical precision -> {vertical_precision:?}");
 
         let latitude_num = c.read_u32::<BigEndian>()?;
         let latitude = Position::from_u32(latitude_num, true);
-        trace!("Parsed latitude -> {:?} ({:?})", latitude_num, latitude);
+        trace!("Parsed latitude -> {latitude_num:?} ({latitude:?})");
 
         let longitude_num = c.read_u32::<BigEndian>()?;
         let longitude = Position::from_u32(longitude_num, false);
-        trace!("Parsed longitude -> {:?} ({:?})", longitude_num, longitude);
+        trace!("Parsed longitude -> {longitude_num:?} ({longitude:?})");
 
         let altitude_num = c.read_u32::<BigEndian>()?;
         let altitude = Altitude::from_u32(altitude_num);
-        trace!("Parsed altitude -> {:?} ({:})", altitude_num, altitude);
+        trace!("Parsed altitude -> {altitude_num:?} ({altitude:})");
 
         Ok(Self {
             size, horizontal_precision, vertical_precision, latitude, longitude, altitude,
@@ -198,11 +197,7 @@ impl fmt::Display for Size {
 
 impl fmt::Display for Position {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}°{}′{}",
-            self.degrees,
-            self.arcminutes,
-            self.arcseconds,
-        )?;
+        write!(f, "{}°{}′{}", self.degrees, self.arcminutes, self.arcseconds)?;
 
         if self.milliarcseconds != 0 {
             write!(f, ".{:03}", self.milliarcseconds)?;
@@ -254,7 +249,7 @@ mod test {
             0x00, 0x98, 0x96, 0x80,  // altitude
         ];
 
-        assert_eq!(LOC::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(LOC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    LOC {
                        size: Size { base: 3, power_of_ten: 2 },
                        horizontal_precision: 0,
@@ -272,7 +267,7 @@ mod test {
             0x00,  // size
         ];
 
-        assert_eq!(LOC::read(buf.len() as _, &mut Cursor::new(buf)),
+        assert_eq!(LOC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)),
                    Err(WireError::WrongRecordLength { stated_length: 2, mandated_length: MandatedLength::Exactly(16) }));
     }
 
@@ -289,7 +284,7 @@ mod test {
             0x12, 0x34, 0x56,  // some other stuff
         ];
 
-        assert_eq!(LOC::read(buf.len() as _, &mut Cursor::new(buf)),
+        assert_eq!(LOC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)),
                    Err(WireError::WrongRecordLength { stated_length: 19, mandated_length: MandatedLength::Exactly(16) }));
     }
 
@@ -300,7 +295,7 @@ mod test {
             0x12, 0x34, 0x56,  // some data in an unknown format
         ];
 
-        assert_eq!(LOC::read(buf.len() as _, &mut Cursor::new(buf)),
+        assert_eq!(LOC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)),
                    Err(WireError::WrongVersion { stated_version: 128, maximum_supported_version: 0 }));
     }
 
@@ -400,13 +395,13 @@ mod position_test {
 
     #[test]
     fn some_latitude() {
-        assert_eq!(Position::from_u32(2332896396, true).unwrap().to_string(),
+        assert_eq!(Position::from_u32(2_332_896_396, true).unwrap().to_string(),
                    String::from("51°30′12.748″ N"));
     }
 
     #[test]
     fn some_longitude() {
-        assert_eq!(Position::from_u32(2147024037, false).unwrap().to_string(),
+        assert_eq!(Position::from_u32(2_147_024_037, false).unwrap().to_string(),
                    String::from("0°7′39.611″ W"));
     }
 
@@ -469,13 +464,13 @@ mod altitude_test {
 
     #[test]
     fn base_level() {
-        assert_eq!(Altitude::from_u32(10000000).to_string(),
+        assert_eq!(Altitude::from_u32(10_000_000).to_string(),
                    String::from("0m"));
     }
 
     #[test]
     fn up_high() {
-        assert_eq!(Altitude::from_u32(20000000).to_string(),
+        assert_eq!(Altitude::from_u32(20_000_000).to_string(),
                    String::from("100000m"));
     }
 
@@ -487,7 +482,7 @@ mod altitude_test {
 
     #[test]
     fn with_decimal() {
-        assert_eq!(Altitude::from_u32(50505050).to_string(),
+        assert_eq!(Altitude::from_u32(50_505_050).to_string(),
                    String::from("405050.50m"));
     }
 }

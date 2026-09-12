@@ -1,0 +1,203 @@
+//! Each transport, against a loopback server.
+
+use std::time::{Duration, Instant};
+
+use test_support::fixtures;
+use test_support::mock::{self, Tcp, Udp};
+
+use crate::common::{dog, run, Run};
+
+#[test]
+fn tcp_replay() {
+    let server = mock::tcp(Tcp::Replay(fixtures::response("a-example-tcp")));
+    let run = Run::of(dog().args([ "-T", "--short", "a-example.lookup.dog" ]).arg(server.at()));
+    assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()), (0, "10.20.30.40\n", ""));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn tcp_reply_arriving_one_byte_at_a_time() {
+    let server = mock::tcp(Tcp::Drip(fixtures::response("a-example-tcp")));
+    let run = Run::of(dog().args([ "-T", "--short", "a-example.lookup.dog" ]).arg(server.at()));
+    assert_eq!((run.status, run.stdout.as_str()), (0, "10.20.30.40\n"));
+}
+
+#[test]
+fn tcp_reply_larger_than_one_read() {
+    let server = mock::tcp(Tcp::Replay(fixtures::response("txt-big-tcp")));
+    let run = Run::of(dog().args([ "-T", "--short", "TXT", "big.dogtest.example" ]).arg(server.at()));
+    assert_eq!(run.status, 0, "{run:?}");
+    assert_eq!(run.stdout.lines().count(), 20);
+}
+
+/// The automatic transport asks over UDP, sees the truncated flag in the
+/// real truncated answer, and asks again over TCP on the same port.
+#[test]
+fn automatic_transport_retries_truncated_answers_over_tcp() {
+    let (udp, tcp) = mock::udp_and_tcp(
+        Udp::Replay(fixtures::response("tc-txt-google")),
+        Tcp::Replay(fixtures::response("tc-txt-google-tcp")),
+    );
+    let run = Run::of(dog().args([ "--short", "--edns", "disable", "TXT", "google.com" ]).arg(udp.at()));
+    assert_eq!(run.status, 0, "{run:?}");
+    assert!(run.stdout.contains("v=spf1"), "{}", run.stdout);
+    assert_eq!((udp.requests().len(), tcp.requests().len()), (1, 1));
+}
+
+#[test]
+fn automatic_transport_keeps_untruncated_udp_answers() {
+    let (udp, tcp) = mock::udp_and_tcp(
+        Udp::Replay(fixtures::response("a-example")),
+        Tcp::Replay(fixtures::response("a-example-tcp")),
+    );
+    let run = Run::of(dog().args([ "--short", "a-example.lookup.dog" ]).arg(udp.at()));
+    assert_eq!((run.status, run.stdout.as_str()), (0, "10.20.30.40\n"));
+    assert_eq!((udp.requests().len(), tcp.requests().len()), (1, 0));
+}
+
+/// With nothing to say how long to wait, dog gives up on a silent server
+/// after five seconds.
+#[test]
+fn a_silent_server_times_out_after_five_seconds() {
+    let server = mock::udp(Udp::Silent);
+    let started = Instant::now();
+    let run = Run::of(dog().args([ "-U", "a-example.lookup.dog" ]).arg(server.at()));
+    let elapsed = started.elapsed();
+
+    assert_eq!((run.status, run.stderr.as_str()), (1, "Error [network]: Timed out after 5s waiting for a response\n"));
+    assert!(elapsed >= Duration::from_millis(4500) && elapsed < Duration::from_secs(8), "{elapsed:?}");
+}
+
+/// A forged datagram arriving before the real answer is ignored.
+#[test]
+fn a_forged_udp_answer_is_ignored() {
+    let server = mock::udp(Udp::WrongTxidThen(fixtures::response("a-example")));
+    let run = Run::of(dog().args([ "-U", "--short", "a-example.lookup.dog" ]).arg(server.at()));
+    assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()), (0, "10.20.30.40\n", ""));
+}
+
+#[test]
+fn a_tcp_answer_to_another_query_is_an_error() {
+    let server = mock::tcp(Tcp::WrongTxid(fixtures::response("a-example-tcp")));
+    let run = Run::of(dog().args([ "-T", "--txid", "0x1234", "a-example.lookup.dog" ]).arg(server.at()));
+    assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()),
+               (1, "", "Error [protocol]: Response ID 0x1235 does not match request ID 0x1234\n"));
+}
+
+#[test]
+fn a_tcp_answer_cut_short_is_an_error() {
+    let server = mock::tcp(Tcp::HalfBodyThenClose(fixtures::response("a-example-tcp")));
+    let run = Run::of(dog().args([ "-T", "a-example.lookup.dog" ]).arg(server.at()));
+    assert_eq!((run.status, run.stderr.as_str()), (1, "Error [network]: Truncated response\n"));
+}
+
+#[test]
+fn nameservers_that_cannot_be_addresses() {
+    let cases: &[(&[&str], &str)] = &[
+        (&[ "a.example", "@127.0.0.1:dns" ], r#"dog: Invalid options: Invalid nameserver "127.0.0.1:dns": its port is not a number from 0 to 65535"#),
+        (&[ "-T", "a.example", "@[::1" ], r#"dog: Invalid options: Invalid nameserver "[::1": its '[' is never closed"#),
+    ];
+
+    for (args, message) in cases {
+        let run = run(args);
+        assert_eq!((run.status, run.stdout.as_str(), run.stderr.trim_end()), (3, "", *message), "{args:?}");
+    }
+}
+
+#[cfg(feature = "with_tls")]
+mod tls {
+    use super::*;
+    use test_support::tls::{self, Tls};
+
+    #[test]
+    fn dns_over_tls_to_a_trusted_server() {
+        let server = tls::tls(Tls::Dns(Tcp::Replay(fixtures::response("a-example-tcp"))));
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path())
+            .args([ "--tls", "--short", "a-example.lookup.dog" ]).arg(server.at()));
+        assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()), (0, "10.20.30.40\n", ""));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn dns_over_tls_to_an_untrusted_server() {
+        let server = tls::tls(Tls::Dns(Tcp::Replay(fixtures::response("a-example-tcp"))));
+        let run = Run::of(dog().args([ "--tls", "a-example.lookup.dog" ]).arg(server.at()));
+        assert_eq!(run.status, 1);
+        assert!(run.stderr.starts_with("Error [tls]: "), "{}", run.stderr);
+        assert!(run.stderr.contains("certificate verify failed"), "{}", run.stderr);
+    }
+
+    #[test]
+    fn dns_over_tls_to_something_that_does_not_speak_tls() {
+        let server = tls::tls(Tls::GarbageHandshake);
+        let run = Run::of(dog().args([ "--tls", "a-example.lookup.dog" ]).arg(server.at()));
+        assert_eq!(run.status, 1);
+        assert!(run.stderr.starts_with("Error [tls]: "), "{}", run.stderr);
+    }
+
+    #[test]
+    fn a_tls_nameserver_with_a_bad_port() {
+        let run = run(&[ "--tls", "a.example", "@127.0.0.1:" ]);
+        assert_eq!((run.status, run.stderr.as_str()),
+                   (3, "dog: Invalid options: Invalid nameserver \"127.0.0.1:\": its port is not a number from 0 to 65535\n"));
+    }
+}
+
+#[cfg(feature = "with_https")]
+mod https {
+    use super::*;
+    use test_support::mock::Http;
+    use test_support::tls::{self, Tls};
+
+    fn url(server: &mock::Server) -> String {
+        format!("@https://localhost:{}/dns-query", server.port())
+    }
+
+    #[test]
+    fn dns_over_https_to_a_trusted_server() {
+        let server = tls::tls(Tls::Http(Http::Reply(fixtures::http_response("doh-cloudflare"))));
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path())
+            .args([ "--https", "--short", "a-example.lookup.dog" ]).arg(url(&server)));
+        assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()), (0, "10.20.30.40\n", ""));
+
+        let expected_start = format!("POST /dns-query HTTP/1.1\r\nHost: localhost:{}\r\n", server.port());
+        assert!(server.requests()[0].starts_with(expected_start.as_bytes()));
+    }
+
+    #[test]
+    fn a_real_not_found_response() {
+        let server = tls::tls(Tls::Http(Http::Reply(fixtures::http_response("doh-google-404"))));
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path())
+            .args([ "--https", "a-example.lookup.dog" ]).arg(url(&server)));
+        assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()),
+                   (1, "", "Error [http]: Nameserver returned HTTP 404 (Not Found)\n"));
+    }
+
+    #[test]
+    fn a_server_that_does_not_speak_http() {
+        let server = tls::tls(Tls::Http(Http::Raw(b"SSH-2.0-OpenSSH_9.2\r\n\r\n".to_vec())));
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path())
+            .args([ "--https", "a-example.lookup.dog" ]).arg(url(&server)));
+        assert_eq!(run.status, 1);
+        assert!(run.stderr.starts_with("Error [http]: "), "{}", run.stderr);
+    }
+
+    #[test]
+    fn a_response_without_a_length() {
+        let response = test_support::wire::map_http_headers(&fixtures::http_response("doh-cloudflare"), |line| {
+            (!line.to_ascii_lowercase().starts_with("content-length:")).then(|| line.to_owned())
+        });
+        let server = tls::tls(Tls::Http(Http::Raw(response)));
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path())
+            .args([ "--https", "a-example.lookup.dog" ]).arg(url(&server)));
+        assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()),
+                   (1, "", "Error [http]: The response has no Content-Length\n"));
+    }
+
+    #[test]
+    fn a_url_without_a_path() {
+        let run = run(&[ "--https", "a.example", "@https://localhost" ]);
+        assert_eq!((run.status, run.stderr.as_str()),
+                   (3, "dog: Invalid options: Invalid DNS-over-HTTPS URL \"https://localhost\": it has no path, such as '/dns-query'\n"));
+    }
+}

@@ -79,6 +79,8 @@ pub use self::uri::URI;
 mod others;
 pub use self::others::UnknownQtype;
 
+pub(crate) mod registry;
+
 
 /// A record that’s been parsed from a byte buffer.
 #[derive(PartialEq, Debug)]

@@ -45,6 +45,7 @@ pub struct Inputs {
 
 /// Weird protocol options that are allowed by the spec but are not common.
 #[derive(PartialEq, Debug, Default, Copy, Clone)]
+#[allow(clippy::struct_excessive_bools)]  // one for each flag the user can set
 pub struct ProtocolTweaks {
 
     /// Set the `AA` (Authoritative Answer) flag in the header of each request.
@@ -89,11 +90,11 @@ impl RequestGenerator {
 
     /// Iterate through the inputs matrix, returning pairs of DNS request list
     /// and the details of the transport to send them down.
-    pub fn generate(self) -> Result<Vec<RequestSet>, ResolverLookupError> {
+    pub fn generate(self, paths: &crate::system::SystemPaths) -> Result<Vec<RequestSet>, ResolverLookupError> {
         let mut requests = Vec::new();
 
         let resolvers = self.inputs.resolver_types.into_iter()
-            .map(ResolverType::obtain)
+            .map(|resolver_type| resolver_type.obtain(paths))
             .collect::<Result<Vec<_>, _>>()?;
 
         for domain in &self.inputs.domains {

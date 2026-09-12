@@ -32,7 +32,6 @@ impl Wire for DS {
     const NAME: &'static str = "DS";
     const RR_TYPE: u16 = 43;
 
-    #[cfg_attr(feature = "with_mutagen", ::mutagen::mutate)]
     fn read(stated_length: u16, c: &mut Cursor<&[u8]>) -> Result<Self, WireError> {
         if stated_length < 5 {
             let mandated_length = MandatedLength::AtLeast(5);
@@ -40,18 +39,18 @@ impl Wire for DS {
         }
 
         let key_tag = c.read_u16::<BigEndian>()?;
-        trace!("Parsed key tag -> {:?}", key_tag);
+        trace!("Parsed key tag -> {key_tag:?}");
 
         let algorithm = c.read_u8()?;
-        trace!("Parsed algorithm -> {:?}", algorithm);
+        trace!("Parsed algorithm -> {algorithm:?}");
 
         let digest_type = c.read_u8()?;
-        trace!("Parsed digest type -> {:?}", digest_type);
+        trace!("Parsed digest type -> {digest_type:?}");
 
         let digest_length = stated_length - 4;
         let mut digest = vec![0_u8; usize::from(digest_length)];
         c.read_exact(&mut digest)?;
-        trace!("Parsed digest -> {:#x?}", digest);
+        trace!("Parsed digest -> {digest:#x?}");
 
         Ok(Self { key_tag, algorithm, digest_type, digest })
     }
@@ -61,39 +60,17 @@ impl DS {
 
     /// Returns the hexadecimal representation of the digest.
     pub fn hex_digest(&self) -> String {
-        self.digest.iter()
-            .map(|byte| format!("{:02x}", byte))
-            .collect()
+        hex(&self.digest)
     }
 
     /// Returns a human-readable name for the algorithm number, if known.
     pub fn algorithm_name(&self) -> Option<&'static str> {
-        match self.algorithm {
-            1 => Some("RSAMD5"),
-            3 => Some("DSA"),
-            5 => Some("RSASHA1"),
-            6 => Some("DSA-NSEC3-SHA1"),
-            7 => Some("RSASHA1-NSEC3-SHA1"),
-            8 => Some("RSASHA256"),
-            10 => Some("RSASHA512"),
-            12 => Some("ECC-GOST"),
-            13 => Some("ECDSAP256SHA256"),
-            14 => Some("ECDSAP384SHA384"),
-            15 => Some("ED25519"),
-            16 => Some("ED448"),
-            _ => None,
-        }
+        super::registry::dnssec_algorithm_name(self.algorithm)
     }
 
     /// Returns a human-readable name for the digest type, if known.
     pub fn digest_type_name(&self) -> Option<&'static str> {
-        match self.digest_type {
-            1 => Some("SHA-1"),
-            2 => Some("SHA-256"),
-            3 => Some("GOST R 34.11-94"),
-            4 => Some("SHA-384"),
-            _ => None,
-        }
+        super::registry::digest_type_name(self.digest_type)
     }
 }
 
@@ -112,7 +89,7 @@ mod test {
             0xAA, 0xBB, 0xCC, 0xDD,  // digest (abbreviated)
         ];
 
-        assert_eq!(DS::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(DS::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    DS {
                        key_tag: 40714,
                        algorithm: 13,
@@ -130,7 +107,7 @@ mod test {
             0x11, 0x22,  // digest
         ];
 
-        assert_eq!(DS::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(DS::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    DS {
                        key_tag: 1,
                        algorithm: 8,
@@ -147,7 +124,7 @@ mod test {
             0x02,        // digest type, but no digest
         ];
 
-        assert_eq!(DS::read(buf.len() as _, &mut Cursor::new(buf)),
+        assert_eq!(DS::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)),
                    Err(WireError::WrongRecordLength { stated_length: 4, mandated_length: MandatedLength::AtLeast(5) }));
     }
 

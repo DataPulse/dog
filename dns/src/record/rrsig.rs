@@ -48,7 +48,6 @@ impl Wire for RRSIG {
     const NAME: &'static str = "RRSIG";
     const RR_TYPE: u16 = 46;
 
-    #[cfg_attr(feature = "with_mutagen", ::mutagen::mutate)]
     fn read(stated_length: u16, c: &mut Cursor<&[u8]>) -> Result<Self, WireError> {
         // Fixed fields before signer name: 2+1+1+4+4+4+2 = 18 bytes
         if stated_length < 19 {
@@ -56,35 +55,24 @@ impl Wire for RRSIG {
             return Err(WireError::WrongRecordLength { stated_length, mandated_length });
         }
 
-        let type_covered = c.read_u16::<BigEndian>()?;
-        trace!("Parsed type covered -> {:?}", type_covered);
-
-        let algorithm = c.read_u8()?;
-        trace!("Parsed algorithm -> {:?}", algorithm);
-
-        let labels = c.read_u8()?;
-        trace!("Parsed labels -> {:?}", labels);
-
-        let original_ttl = c.read_u32::<BigEndian>()?;
-        trace!("Parsed original TTL -> {:?}", original_ttl);
-
-        let signature_expiration = c.read_u32::<BigEndian>()?;
-        trace!("Parsed signature expiration -> {:?}", signature_expiration);
-
-        let signature_inception = c.read_u32::<BigEndian>()?;
-        trace!("Parsed signature inception -> {:?}", signature_inception);
-
-        let key_tag = c.read_u16::<BigEndian>()?;
-        trace!("Parsed key tag -> {:?}", key_tag);
+        let fixed = FixedFields::read(c)?;
+        trace!("Parsed fixed fields -> {fixed:?}");
 
         let (signer_name, signer_name_length) = c.read_labels()?;
-        trace!("Parsed signer name -> {:?}", signer_name);
+        trace!("Parsed signer name -> {signer_name:?}");
 
-        let signature_length = stated_length - 18 - signer_name_length;
+        // The signature is whatever the stated length leaves after the fixed
+        // fields and the signer name. A name that runs past the stated
+        // length makes the record malformed; subtracting blindly would
+        // underflow.
+        let length_after_labels = signer_name_length.saturating_add(18);
+        let signature_length = stated_length.checked_sub(length_after_labels)
+            .ok_or(WireError::WrongLabelLength { stated_length, length_after_labels })?;
         let mut signature = vec![0_u8; usize::from(signature_length)];
         c.read_exact(&mut signature)?;
-        trace!("Parsed signature -> {:#x?}", signature);
+        trace!("Parsed signature -> {signature:#x?}");
 
+        let FixedFields { type_covered, algorithm, labels, original_ttl, signature_expiration, signature_inception, key_tag } = fixed;
         Ok(Self {
             type_covered, algorithm, labels, original_ttl,
             signature_expiration, signature_inception, key_tag,
@@ -93,56 +81,51 @@ impl Wire for RRSIG {
     }
 }
 
+/// The fields of an RRSIG record that come before the signer name, which
+/// all have fixed sizes.
+#[derive(Debug)]
+struct FixedFields {
+    type_covered: u16,
+    algorithm: u8,
+    labels: u8,
+    original_ttl: u32,
+    signature_expiration: u32,
+    signature_inception: u32,
+    key_tag: u16,
+}
+
+impl FixedFields {
+    fn read(c: &mut Cursor<&[u8]>) -> Result<Self, WireError> {
+        // Struct fields are evaluated in the order they are written, which
+        // is the order they appear on the wire.
+        Ok(Self {
+            type_covered:         c.read_u16::<BigEndian>()?,
+            algorithm:            c.read_u8()?,
+            labels:               c.read_u8()?,
+            original_ttl:         c.read_u32::<BigEndian>()?,
+            signature_expiration: c.read_u32::<BigEndian>()?,
+            signature_inception:  c.read_u32::<BigEndian>()?,
+            key_tag:              c.read_u16::<BigEndian>()?,
+        })
+    }
+}
+
 impl RRSIG {
 
     /// Returns the base64-encoded signature.
     pub fn base64_signature(&self) -> String {
-        base64::encode(&self.signature)
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&self.signature)
     }
 
     /// Returns a human-readable name for the algorithm number, if known.
     pub fn algorithm_name(&self) -> Option<&'static str> {
-        match self.algorithm {
-            1 => Some("RSAMD5"),
-            3 => Some("DSA"),
-            5 => Some("RSASHA1"),
-            6 => Some("DSA-NSEC3-SHA1"),
-            7 => Some("RSASHA1-NSEC3-SHA1"),
-            8 => Some("RSASHA256"),
-            10 => Some("RSASHA512"),
-            12 => Some("ECC-GOST"),
-            13 => Some("ECDSAP256SHA256"),
-            14 => Some("ECDSAP384SHA384"),
-            15 => Some("ED25519"),
-            16 => Some("ED448"),
-            _ => None,
-        }
+        super::registry::dnssec_algorithm_name(self.algorithm)
     }
 
-    /// Returns a human-readable name for the type covered, if it's a
-    /// well-known record type.
+    /// Returns the name of the type covered, if that type has a name.
     pub fn type_covered_name(&self) -> Option<&'static str> {
-        match self.type_covered {
-            1 => Some("A"),
-            2 => Some("NS"),
-            5 => Some("CNAME"),
-            6 => Some("SOA"),
-            12 => Some("PTR"),
-            15 => Some("MX"),
-            16 => Some("TXT"),
-            28 => Some("AAAA"),
-            33 => Some("SRV"),
-            43 => Some("DS"),
-            44 => Some("SSHFP"),
-            46 => Some("RRSIG"),
-            47 => Some("NSEC"),
-            48 => Some("DNSKEY"),
-            50 => Some("NSEC3"),
-            51 => Some("NSEC3PARAM"),
-            52 => Some("TLSA"),
-            257 => Some("CAA"),
-            _ => None,
-        }
+        super::registry::record_type_name(self.type_covered)
     }
 }
 
@@ -168,14 +151,14 @@ mod test {
             0xAA, 0xBB, 0xCC, 0xDD,  // signature (abbreviated)
         ];
 
-        assert_eq!(RRSIG::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(RRSIG::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    RRSIG {
                        type_covered: 1,
                        algorithm: 13,
                        labels: 2,
                        original_ttl: 3600,
-                       signature_expiration: 0x678A1B80,
-                       signature_inception: 0x67689C00,
+                       signature_expiration: 0x678A_1B80,
+                       signature_inception: 0x6768_9C00,
                        key_tag: 2371,
                        signer_name: Labels::encode("example.com").unwrap(),
                        signature: vec![ 0xAA, 0xBB, 0xCC, 0xDD ],
@@ -195,7 +178,7 @@ mod test {
             // missing signer name and signature
         ];
 
-        assert_eq!(RRSIG::read(buf.len() as _, &mut Cursor::new(buf)),
+        assert_eq!(RRSIG::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)),
                    Err(WireError::WrongRecordLength { stated_length: 18, mandated_length: MandatedLength::AtLeast(19) }));
     }
 

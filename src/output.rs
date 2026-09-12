@@ -3,11 +3,12 @@
 use std::fmt;
 use std::time::Duration;
 use std::env;
+use std::io::{self, IsTerminal};
 
 use dns::{Response, Query, Answer, QClass, ErrorCode, Flags, Opcode, WireError, MandatedLength};
 use dns::record::{Record, RecordType, UnknownQtype, OPT};
 use dns_transport::Error as TransportError;
-use json::{object, JsonValue};
+use serde_json::Value as JsonValue;
 
 use crate::colours::Colours;
 use crate::table::{Table, Section};
@@ -56,7 +57,7 @@ impl UseColours {
     /// overridden the colour setting, and if not, whether output is to a
     /// terminal.
     pub fn should_use_colours(self) -> bool {
-        self == Self::Always || (atty::is(atty::Stream::Stdout) && env::var("NO_COLOR").is_err() && self != Self::Never)
+        self == Self::Always || (io::stdout().is_terminal() && env::var("NO_COLOR").is_err() && self != Self::Never)
     }
 
     /// Creates a palette of colours depending on the user’s wishes or whether
@@ -78,88 +79,31 @@ impl OutputFormat {
     /// settings. If the duration has been measured, it should also be
     /// printed. Returns `false` if there were no results to print, and `true`
     /// otherwise.
-    pub fn print(self, responses: Vec<Response>, duration: Option<Duration>) -> bool {
-        match self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if standard output cannot be written to, such as
+    /// when whatever was reading it has gone away.
+    pub fn print(self, responses: Vec<Response>, duration: Option<Duration>) -> io::Result<bool> {
+        use std::io::Write;
+
+        let mut out = io::stdout().lock();
+        let printed = match self {
             Self::Short(tf) => {
-                let all_answers = responses.into_iter().flat_map(|r| r.answers).collect::<Vec<_>>();
-
-                if all_answers.is_empty() {
-                    eprintln!("No results");
-                    return false;
-                }
-
-                for answer in all_answers {
-                    match answer {
-                        Answer::Standard { record, .. } => {
-                            println!("{}", tf.record_payload_summary(record))
-                        }
-                        Answer::Pseudo { opt, .. } => {
-                            println!("{}", tf.pseudo_record_payload_summary(opt))
-                        }
-                    }
-
-                }
+                print_short(&mut out, tf, responses)?
             }
             Self::JSON => {
-                let mut rs = Vec::new();
-
-                for response in responses {
-                    let json = object! {
-                        "flags": json_flags(response.flags),
-                        "queries": json_queries(response.queries),
-                        "answers": json_answers(response.answers),
-                        "authorities": json_answers(response.authorities),
-                        "additionals": json_answers(response.additionals),
-                    };
-
-                    rs.push(json);
-                }
-
-                if let Some(duration) = duration {
-                    let object = object! {
-                        "responses": rs,
-                        "duration": {
-                            "secs": duration.as_secs(),
-                            "millis": duration.subsec_millis(),
-                        },
-                    };
-
-                    println!("{}", object);
-                }
-                else {
-                    let object = object! {
-                        "responses": rs,
-                    };
-
-                    println!("{}", object);
-                }
+                print_json(&mut out, responses, duration)?;
+                true
             }
             Self::Text(uc, tf) => {
-                let mut table = Table::new(uc.palette(), tf);
-
-                for response in responses {
-                    if let Some(rcode) = response.flags.error_code {
-                        print_error_code(rcode);
-                    }
-
-                    for a in response.answers {
-                        table.add_row(a, Section::Answer);
-                    }
-
-                    for a in response.authorities {
-                        table.add_row(a, Section::Authority);
-                    }
-
-                    for a in response.additionals {
-                        table.add_row(a, Section::Additional);
-                    }
-                }
-
-                table.print(duration);
+                print_text(&mut out, uc, tf, responses, duration)?;
+                true
             }
-        }
+        };
 
-        true
+        out.flush()?;
+        Ok(printed)
     }
 
     /// Print an error that’s ocurred while sending or receiving DNS packets
@@ -171,15 +115,109 @@ impl OutputFormat {
             }
 
             Self::JSON => {
-                let object = object! {
+                let object = serde_json::json!({
                     "error": true,
                     "error_phase": erroneous_phase(&error),
                     "error_message": error_message(error),
-                };
+                });
 
-                eprintln!("{}", object);
+                eprintln!("{object}");
             }
         }
+    }
+}
+
+/// Writes a summary of every answer, one per line, or prints “No results”
+/// if there are none. Returns whether there were any answers.
+fn print_short(out: &mut impl io::Write, tf: TextFormat, responses: Vec<Response>) -> io::Result<bool> {
+    let all_answers = responses.into_iter().flat_map(|r| r.answers).collect::<Vec<_>>();
+
+    if all_answers.is_empty() {
+        eprintln!("No results");
+        return Ok(false);
+    }
+
+    for answer in all_answers {
+        writeln!(out, "{}", answer_summary(tf, answer))?;
+    }
+
+    Ok(true)
+}
+
+fn answer_summary(tf: TextFormat, answer: Answer) -> String {
+    match answer {
+        Answer::Standard { record, .. }  => tf.record_payload_summary(record),
+        Answer::Pseudo { opt, .. }       => TextFormat::pseudo_record_payload_summary(&opt),
+    }
+}
+
+/// Writes every response as a single JSON document.
+fn print_json(out: &mut impl io::Write, responses: Vec<Response>, duration: Option<Duration>) -> io::Result<()> {
+    let responses = responses.into_iter().map(json_response).collect::<Vec<_>>();
+
+    let object = match duration {
+        Some(duration) => serde_json::json!({
+            "responses": responses,
+            "duration": {
+                "secs": duration.as_secs(),
+                "millis": duration.subsec_millis(),
+            },
+        }),
+        None => serde_json::json!({
+            "responses": responses,
+        }),
+    };
+
+    writeln!(out, "{object}")
+}
+
+fn json_response(response: Response) -> JsonValue {
+    serde_json::json!({
+        "flags": json_flags(response.flags),
+        "queries": json_queries(&response.queries),
+        "answers": json_answers(response.answers),
+        "authorities": json_answers(response.authorities),
+        "additionals": json_answers(response.additionals),
+    })
+}
+
+/// Writes the records of every response as a table, after the status of
+/// each response that has an error code.
+fn print_text(out: &mut impl io::Write, uc: UseColours, tf: TextFormat, responses: Vec<Response>, duration: Option<Duration>) -> io::Result<()> {
+    let mut table = Table::new(uc.palette(), tf);
+
+    for response in responses {
+        if let Some(rcode) = response.flags.error_code {
+            writeln!(out, "Status: {}", error_code_description(rcode))?;
+        }
+
+        for a in response.answers {
+            table.add_row(a, Section::Answer);
+        }
+
+        for a in response.authorities {
+            table.add_row(a, Section::Authority);
+        }
+
+        for a in response.additionals {
+            table.add_row(a, Section::Additional);
+        }
+    }
+
+    table.print(out, duration)
+}
+
+/// How the status line describes a response’s error code.
+fn error_code_description(rcode: ErrorCode) -> String {
+    match rcode {
+        ErrorCode::FormatError     => "Format Error".into(),
+        ErrorCode::ServerFailure   => "Server Failure".into(),
+        ErrorCode::NXDomain        => "NXDomain".into(),
+        ErrorCode::NotImplemented  => "Not Implemented".into(),
+        ErrorCode::QueryRefused    => "Query Refused".into(),
+        ErrorCode::BadVersion      => "Bad Version".into(),
+        ErrorCode::Private(num)    => format!("Private Reason ({num})"),
+        ErrorCode::Other(num)      => format!("Other Failure ({num})"),
     }
 }
 
@@ -190,140 +228,85 @@ impl TextFormat {
     /// depends on what record it’s for.
     pub fn record_payload_summary(self, record: Record) -> String {
         match record {
-            Record::A(a) => {
-                format!("{}", a.address)
-            }
-            Record::AAAA(aaaa) => {
-                format!("{}", aaaa.address)
-            }
-            Record::CAA(caa) => {
-                if caa.critical {
-                    format!("{} {} (critical)", Ascii(&caa.tag), Ascii(&caa.value))
-                }
-                else {
-                    format!("{} {} (non-critical)", Ascii(&caa.tag), Ascii(&caa.value))
-                }
-            }
-            Record::CNAME(cname) => {
-                format!("{:?}", cname.domain.to_string())
-            }
-            Record::DNSKEY(dnskey) => {
-                format!("{} {} {} {}",
-                    dnskey.flags,
-                    dnskey.protocol,
-                    dnskey.algorithm,
-                    dnskey.base64_public_key(),
-                )
-            }
-            Record::DS(ds) => {
-                format!("{} {} {} {}",
-                    ds.key_tag,
-                    ds.algorithm,
-                    ds.digest_type,
-                    ds.hex_digest(),
-                )
-            }
-            Record::EUI48(eui48) => {
-                format!("{:?}", eui48.formatted_address())
-            }
-            Record::EUI64(eui64) => {
-                format!("{:?}", eui64.formatted_address())
-            }
-            Record::HINFO(hinfo) => {
-                format!("{} {}", Ascii(&hinfo.cpu), Ascii(&hinfo.os))
-            }
-            Record::LOC(loc) => {
-                format!("{} ({}, {}) ({}, {}, {})",
-                    loc.size,
-                    loc.horizontal_precision,
-                    loc.vertical_precision,
-                    loc.latitude .map_or_else(|| "Out of range".into(), |e| e.to_string()),
-                    loc.longitude.map_or_else(|| "Out of range".into(), |e| e.to_string()),
-                    loc.altitude,
-                )
-            }
-            Record::MX(mx) => {
-                format!("{} {:?}", mx.preference, mx.exchange.to_string())
-            }
-            Record::NAPTR(naptr) => {
-                format!("{} {} {} {} {} {:?}",
-                    naptr.order,
-                    naptr.preference,
-                    Ascii(&naptr.flags),
-                    Ascii(&naptr.service),
-                    Ascii(&naptr.regex),
-                    naptr.replacement.to_string(),
-                )
-            }
-            Record::NS(ns) => {
-                format!("{:?}", ns.nameserver.to_string())
-            }
-            Record::NSEC(nsec) => {
-                format!("{:?} {}",
-                    nsec.next_domain.to_string(),
-                    nsec.type_names().join(" "),
-                )
-            }
-            Record::OPENPGPKEY(opgp) => {
-                format!("{:?}", opgp.base64_key())
-            }
-            Record::PTR(ptr) => {
-                format!("{:?}", ptr.cname.to_string())
-            }
-            Record::RRSIG(rrsig) => {
-                format!("{} {} {} {:?} {}",
-                    rrsig.type_covered_name().unwrap_or("?"),
-                    rrsig.algorithm,
-                    rrsig.key_tag,
-                    rrsig.signer_name.to_string(),
-                    rrsig.base64_signature(),
-                )
-            }
-            Record::SSHFP(sshfp) => {
-                format!("{} {} {}",
-                    sshfp.algorithm,
-                    sshfp.fingerprint_type,
-                    sshfp.hex_fingerprint(),
-                )
-            }
-            Record::SOA(soa) => {
-                format!("{:?} {:?} {} {} {} {} {}",
-                    soa.mname.to_string(),
-                    soa.rname.to_string(),
-                    soa.serial,
-                    self.format_duration(soa.refresh_interval),
-                    self.format_duration(soa.retry_interval),
-                    self.format_duration(soa.expire_limit),
-                    self.format_duration(soa.minimum_ttl),
-                )
-            }
-            Record::SRV(srv) => {
-                format!("{} {} {:?}:{}", srv.priority, srv.weight, srv.target.to_string(), srv.port)
-            }
-            Record::TLSA(tlsa) => {
-                format!("{} {} {} {:?}",
-                    tlsa.certificate_usage,
-                    tlsa.selector,
-                    tlsa.matching_type,
-                    tlsa.hex_certificate_data(),
-                )
-            }
-            Record::TXT(txt) => {
-                let messages = txt.messages.iter().map(|t| Ascii(t).to_string()).collect::<Vec<_>>();
-                messages.join(", ")
-            }
-            Record::URI(uri) => {
-                format!("{} {} {}", uri.priority, uri.weight, Ascii(&uri.target))
-            }
-            Record::Other { bytes, .. } => {
-                format!("{:?}", bytes)
-            }
+            Record::A(a)                 => a.address.to_string(),
+            Record::AAAA(aaaa)           => aaaa.address.to_string(),
+            Record::CAA(caa)             => Self::caa_summary(&caa),
+            Record::CNAME(cname)         => format!("{:?}", cname.domain.to_string()),
+            Record::DNSKEY(dnskey)       => format!("{} {} {} {}", dnskey.flags, dnskey.protocol, dnskey.algorithm, dnskey.base64_public_key()),
+            Record::DS(ds)               => format!("{} {} {} {}", ds.key_tag, ds.algorithm, ds.digest_type, ds.hex_digest()),
+            Record::EUI48(eui48)         => format!("{:?}", eui48.formatted_address()),
+            Record::EUI64(eui64)         => format!("{:?}", eui64.formatted_address()),
+            Record::HINFO(hinfo)         => format!("{} {}", Ascii(&hinfo.cpu), Ascii(&hinfo.os)),
+            Record::LOC(loc)             => Self::loc_summary(&loc),
+            Record::MX(mx)               => format!("{} {:?}", mx.preference, mx.exchange.to_string()),
+            Record::NAPTR(naptr)         => Self::naptr_summary(&naptr),
+            Record::NS(ns)               => format!("{:?}", ns.nameserver.to_string()),
+            Record::NSEC(nsec)           => format!("{:?} {}", nsec.next_domain.to_string(), nsec.type_names().join(" ")),
+            Record::OPENPGPKEY(opgp)     => format!("{:?}", opgp.base64_key()),
+            Record::PTR(ptr)             => format!("{:?}", ptr.cname.to_string()),
+            Record::RRSIG(rrsig)         => Self::rrsig_summary(&rrsig),
+            Record::SSHFP(sshfp)         => format!("{} {} {}", sshfp.algorithm, sshfp.fingerprint_type, sshfp.hex_fingerprint()),
+            Record::SOA(soa)             => self.soa_summary(&soa),
+            Record::SRV(srv)             => format!("{} {} {:?}:{}", srv.priority, srv.weight, srv.target.to_string(), srv.port),
+            Record::TLSA(tlsa)           => format!("{} {} {} {:?}", tlsa.certificate_usage, tlsa.selector, tlsa.matching_type, tlsa.hex_certificate_data()),
+            Record::TXT(txt)             => txt.messages.iter().map(|t| Ascii(t).to_string()).collect::<Vec<_>>().join(", "),
+            Record::URI(uri)             => format!("{} {} {}", uri.priority, uri.weight, Ascii(&uri.target)),
+            Record::Other { bytes, .. }  => format!("{bytes:?}"),
         }
+    }
+
+    fn caa_summary(caa: &dns::record::CAA) -> String {
+        let criticality = if caa.critical { "critical" } else { "non-critical" };
+        format!("{} {} ({})", Ascii(&caa.tag), Ascii(&caa.value), criticality)
+    }
+
+    fn loc_summary(loc: &dns::record::LOC) -> String {
+        format!("{} ({}, {}) ({}, {}, {})",
+            loc.size,
+            loc.horizontal_precision,
+            loc.vertical_precision,
+            loc.latitude .as_ref().map_or_else(|| "Out of range".into(), ToString::to_string),
+            loc.longitude.as_ref().map_or_else(|| "Out of range".into(), ToString::to_string),
+            loc.altitude,
+        )
+    }
+
+    fn naptr_summary(naptr: &dns::record::NAPTR) -> String {
+        format!("{} {} {} {} {} {:?}",
+            naptr.order,
+            naptr.preference,
+            Ascii(&naptr.flags),
+            Ascii(&naptr.service),
+            Ascii(&naptr.regex),
+            naptr.replacement.to_string(),
+        )
+    }
+
+    fn rrsig_summary(rrsig: &dns::record::RRSIG) -> String {
+        format!("{} {} {} {:?} {}",
+            rrsig.type_covered_name().unwrap_or("?"),
+            rrsig.algorithm,
+            rrsig.key_tag,
+            rrsig.signer_name.to_string(),
+            rrsig.base64_signature(),
+        )
+    }
+
+    fn soa_summary(self, soa: &dns::record::SOA) -> String {
+        format!("{:?} {:?} {} {} {} {} {}",
+            soa.mname.to_string(),
+            soa.rname.to_string(),
+            soa.serial,
+            self.format_duration(soa.refresh_interval),
+            self.format_duration(soa.retry_interval),
+            self.format_duration(soa.expire_limit),
+            self.format_duration(soa.minimum_ttl),
+        )
     }
 
     /// Formats a summary of an OPT pseudo-record. Pseudo-records have a different
     /// structure than standard ones.
-    pub fn pseudo_record_payload_summary(self, opt: OPT) -> String {
+    pub fn pseudo_record_payload_summary(opt: &OPT) -> String {
         format!("{} {} {} {} {:?}",
             opt.udp_payload_size,
             opt.higher_bits,
@@ -339,7 +322,7 @@ impl TextFormat {
             format_duration_hms(seconds)
         }
         else {
-            format!("{}", seconds)
+            format!("{seconds}")
         }
     }
 }
@@ -348,7 +331,7 @@ impl TextFormat {
 /// zero units.
 fn format_duration_hms(seconds: u32) -> String {
     if seconds < 60 {
-        format!("{}s", seconds)
+        format!("{seconds}s")
     }
     else if seconds < 60 * 60 {
         format!("{}m{:02}s",
@@ -372,12 +355,28 @@ fn format_duration_hms(seconds: u32) -> String {
 
 /// Serialises DNS response flags as a JSON value.
 fn json_flags(flags: Flags) -> JsonValue {
-    let opcode = match flags.opcode {
-        Opcode::Query    => "QUERY".into(),
-        Opcode::Other(n) => JsonValue::from(n),
-    };
+    serde_json::json!({
+        "qr"     : flags.response,
+        "opcode" : json_opcode(flags.opcode),
+        "aa"     : flags.authoritative,
+        "tc"     : flags.truncated,
+        "rd"     : flags.recursion_desired,
+        "ra"     : flags.recursion_available,
+        "ad"     : flags.authentic_data,
+        "cd"     : flags.checking_disabled,
+        "rcode"  : json_rcode(flags.error_code),
+    })
+}
 
-    let rcode = match flags.error_code {
+fn json_opcode(opcode: Opcode) -> JsonValue {
+    match opcode {
+        Opcode::Query    => "QUERY".into(),
+        Opcode::Other(n) => n.into(),
+    }
+}
+
+fn json_rcode(error_code: Option<ErrorCode>) -> JsonValue {
+    match error_code {
         None                            => "NOERROR".into(),
         Some(ErrorCode::FormatError)    => "FORMERR".into(),
         Some(ErrorCode::ServerFailure)  => "SERVFAIL".into(),
@@ -385,63 +384,42 @@ fn json_flags(flags: Flags) -> JsonValue {
         Some(ErrorCode::NotImplemented) => "NOTIMP".into(),
         Some(ErrorCode::QueryRefused)   => "REFUSED".into(),
         Some(ErrorCode::BadVersion)     => "BADVERS".into(),
-        Some(ErrorCode::Other(n))       => JsonValue::from(n),
-        Some(ErrorCode::Private(n))     => JsonValue::from(n),
-    };
-
-    object! {
-        "qr"     : flags.response,
-        "opcode" : opcode,
-        "aa"     : flags.authoritative,
-        "tc"     : flags.truncated,
-        "rd"     : flags.recursion_desired,
-        "ra"     : flags.recursion_available,
-        "ad"     : flags.authentic_data,
-        "cd"     : flags.checking_disabled,
-        "rcode"  : rcode,
+        Some(ErrorCode::Other(n) | ErrorCode::Private(n)) => n.into(),
     }
 }
 
 /// Serialises multiple DNS queries as a JSON value.
-fn json_queries(queries: Vec<Query>) -> JsonValue {
-    let queries = queries.iter().map(|q| {
-        object! {
-            "name": q.qname.to_string(),
-            "class": json_class(q.qclass),
-            "type": json_record_type_name(q.qtype),
-        }
-    }).collect::<Vec<_>>();
-
-    queries.into()
+fn json_queries(queries: &[Query]) -> JsonValue {
+    queries.iter().map(|q| serde_json::json!({
+        "name": q.qname.to_string(),
+        "class": json_class(q.qclass),
+        "type": json_record_type_name(q.qtype),
+    })).collect()
 }
 
 /// Serialises multiple received DNS answers as a JSON value.
 fn json_answers(answers: Vec<Answer>) -> JsonValue {
-    let answers = answers.into_iter().map(|a| {
-        match a {
-            Answer::Standard { qname, qclass, ttl, record } => {
-                object! {
-                    "name": qname.to_string(),
-                    "class": json_class(qclass),
-                    "ttl": ttl,
-                    "type": json_record_name(&record),
-                    "data": json_record_data(record),
-                }
-            }
-            Answer::Pseudo { qname, opt } => {
-                object! {
-                    "name": qname.to_string(),
-                    "type": "OPT",
-                    "data": {
-                        "version": opt.edns0_version,
-                        "data": opt.data,
-                    },
-                }
-            }
-        }
-    }).collect::<Vec<_>>();
+    answers.into_iter().map(json_answer).collect()
+}
 
-    answers.into()
+fn json_answer(answer: Answer) -> JsonValue {
+    match answer {
+        Answer::Standard { qname, qclass, ttl, record } => serde_json::json!({
+            "name": qname.to_string(),
+            "class": json_class(qclass),
+            "ttl": ttl,
+            "type": json_record_name(&record),
+            "data": json_record_data(record),
+        }),
+        Answer::Pseudo { qname, opt } => serde_json::json!({
+            "name": qname.to_string(),
+            "type": "OPT",
+            "data": {
+                "version": opt.edns0_version,
+                "data": opt.data,
+            },
+        }),
+    }
 }
 
 
@@ -527,204 +505,151 @@ fn json_record_name(record: &Record) -> JsonValue {
 
 
 /// Serialises a received DNS record as a JSON value.
-
+///
 /// Even though DNS doesn’t specify a character encoding, strings are still
 /// converted from UTF-8, because JSON specifies UTF-8.
 fn json_record_data(record: Record) -> JsonValue {
     match record {
-        Record::A(a) => {
-            object! {
-                "address": a.address.to_string(),
-            }
-        }
-        Record::AAAA(aaaa) => {
-            object! {
-                "address": aaaa.address.to_string(),
-            }
-        }
-        Record::CAA(caa) => {
-            object! {
-                "critical": caa.critical,
-                "tag": String::from_utf8_lossy(&caa.tag).to_string(),
-                "value": String::from_utf8_lossy(&caa.value).to_string(),
-            }
-        }
-        Record::CNAME(cname) => {
-            object! {
-                "domain": cname.domain.to_string(),
-            }
-        }
-        Record::DNSKEY(dnskey) => {
-            let mut data = object! {
-                "flags": dnskey.flags,
-                "protocol": dnskey.protocol,
-                "algorithm": dnskey.algorithm,
-            };
-            if let Some(name) = dnskey.algorithm_name() {
-                data["algorithm_name"] = name.into();
-            }
-            data["public_key"] = dnskey.base64_public_key().into();
-            data
-        }
-        Record::DS(ds) => {
-            let mut data = object! {
-                "key_tag": ds.key_tag,
-                "algorithm": ds.algorithm,
-            };
-            if let Some(name) = ds.algorithm_name() {
-                data["algorithm_name"] = name.into();
-            }
-            data["digest_type"] = ds.digest_type.into();
-            if let Some(name) = ds.digest_type_name() {
-                data["digest_type_name"] = name.into();
-            }
-            data["digest"] = ds.hex_digest().into();
-            data
-        }
-        Record::EUI48(eui48) => {
-            object! {
-                "identifier": eui48.formatted_address(),
-            }
-        }
-        Record::EUI64(eui64) => {
-            object! {
-                "identifier": eui64.formatted_address(),
-            }
-        }
-        Record::HINFO(hinfo) => {
-            object! {
-                "cpu": String::from_utf8_lossy(&hinfo.cpu).to_string(),
-                "os": String::from_utf8_lossy(&hinfo.os).to_string(),
-            }
-        }
-        Record::LOC(loc) => {
-            object! {
-                "size": loc.size.to_string(),
-                "precision": {
-                    "horizontal": loc.horizontal_precision,
-                    "vertical": loc.vertical_precision,
-                },
-                "point": {
-                    "latitude": loc.latitude.map(|e| e.to_string()),
-                    "longitude": loc.longitude.map(|e| e.to_string()),
-                    "altitude": loc.altitude.to_string(),
-                },
-            }
-        }
-        Record::MX(mx) => {
-            object! {
-                "preference": mx.preference,
-                "exchange": mx.exchange.to_string(),
-            }
-        }
-        Record::NAPTR(naptr) => {
-            object! {
-                "order": naptr.order,
-                "flags": String::from_utf8_lossy(&naptr.flags).to_string(),
-                "service": String::from_utf8_lossy(&naptr.service).to_string(),
-                "regex": String::from_utf8_lossy(&naptr.regex).to_string(),
-                "replacement": naptr.replacement.to_string(),
-            }
-        }
-        Record::NS(ns) => {
-            object! {
-                "nameserver": ns.nameserver.to_string(),
-            }
-        }
-        Record::NSEC(nsec) => {
-            let type_names: Vec<JsonValue> = nsec.type_names().into_iter()
-                .map(|s| s.into())
-                .collect();
-            object! {
-                "next_domain": nsec.next_domain.to_string(),
-                "types": type_names,
-            }
-        }
-        Record::OPENPGPKEY(opgp) => {
-            object! {
-                "key": opgp.base64_key(),
-            }
-        }
-        Record::PTR(ptr) => {
-            object! {
-                "cname": ptr.cname.to_string(),
-            }
-        }
-        Record::RRSIG(rrsig) => {
-            let mut data = object! {
-                "type_covered": rrsig.type_covered,
-            };
-            if let Some(name) = rrsig.type_covered_name() {
-                data["type_covered_name"] = name.into();
-            }
-            data["algorithm"] = rrsig.algorithm.into();
-            if let Some(name) = rrsig.algorithm_name() {
-                data["algorithm_name"] = name.into();
-            }
-            data["labels"] = rrsig.labels.into();
-            data["original_ttl"] = rrsig.original_ttl.into();
-            data["signature_expiration"] = rrsig.signature_expiration.into();
-            data["signature_inception"] = rrsig.signature_inception.into();
-            data["key_tag"] = rrsig.key_tag.into();
-            data["signer_name"] = rrsig.signer_name.to_string().into();
-            data["signature"] = rrsig.base64_signature().into();
-            data
-        }
-        Record::SSHFP(sshfp) => {
-            object! {
-                "algorithm": sshfp.algorithm,
-                "fingerprint_type": sshfp.fingerprint_type,
-                "fingerprint": sshfp.hex_fingerprint(),
-            }
-        }
-        Record::SOA(soa) => {
-            object! {
-                "mname": soa.mname.to_string(),
-                "rname": soa.rname.to_string(),
-                "serial": soa.serial,
-                "refresh": soa.refresh_interval,
-                "retry": soa.retry_interval,
-                "expire": soa.expire_limit,
-                "minimum": soa.minimum_ttl,
-            }
-        }
-        Record::SRV(srv) => {
-            object! {
-                "priority": srv.priority,
-                "weight": srv.weight,
-                "port": srv.port,
-                "target": srv.target.to_string(),
-            }
-        }
-        Record::TLSA(tlsa) => {
-            object! {
-                "certificate_usage": tlsa.certificate_usage,
-                "selector": tlsa.selector,
-                "matching_type": tlsa.matching_type,
-                "certificate_data": tlsa.hex_certificate_data(),
-            }
-        }
-        Record::TXT(txt) => {
-            let ms = txt.messages.into_iter()
-                        .map(|txt| String::from_utf8_lossy(&txt).to_string())
-                        .collect::<Vec<_>>();
-            object! {
-                "messages": ms,
-            }
-        }
-        Record::URI(uri) => {
-            object! {
-                "priority": uri.priority,
-                "weight": uri.weight,
-                "target": String::from_utf8_lossy(&uri.target).to_string(),
-            }
-        }
-        Record::Other { bytes, .. } => {
-            object! {
-                "bytes": bytes,
-            }
-        }
+        Record::A(a)                 => serde_json::json!({ "address": a.address.to_string() }),
+        Record::AAAA(aaaa)           => serde_json::json!({ "address": aaaa.address.to_string() }),
+        Record::CAA(caa)             => serde_json::json!({ "critical": caa.critical, "tag": lossy(&caa.tag), "value": lossy(&caa.value) }),
+        Record::CNAME(cname)         => serde_json::json!({ "domain": cname.domain.to_string() }),
+        Record::DNSKEY(dnskey)       => json_dnskey(&dnskey),
+        Record::DS(ds)               => json_ds(&ds),
+        Record::EUI48(eui48)         => serde_json::json!({ "identifier": eui48.formatted_address() }),
+        Record::EUI64(eui64)         => serde_json::json!({ "identifier": eui64.formatted_address() }),
+        Record::HINFO(hinfo)         => serde_json::json!({ "cpu": lossy(&hinfo.cpu), "os": lossy(&hinfo.os) }),
+        Record::LOC(loc)             => json_loc(&loc),
+        Record::MX(mx)               => serde_json::json!({ "preference": mx.preference, "exchange": mx.exchange.to_string() }),
+        Record::NAPTR(naptr)         => json_naptr(&naptr),
+        Record::NS(ns)               => serde_json::json!({ "nameserver": ns.nameserver.to_string() }),
+        Record::NSEC(nsec)           => serde_json::json!({ "next_domain": nsec.next_domain.to_string(), "types": nsec.type_names() }),
+        Record::OPENPGPKEY(opgp)     => serde_json::json!({ "key": opgp.base64_key() }),
+        Record::PTR(ptr)             => serde_json::json!({ "cname": ptr.cname.to_string() }),
+        Record::RRSIG(rrsig)         => json_rrsig(&rrsig),
+        Record::SSHFP(sshfp)         => json_sshfp(&sshfp),
+        Record::SOA(soa)             => json_soa(&soa),
+        Record::SRV(srv)             => json_srv(&srv),
+        Record::TLSA(tlsa)           => json_tlsa(&tlsa),
+        Record::TXT(txt)             => serde_json::json!({ "messages": txt.messages.iter().map(|m| lossy(m)).collect::<Vec<_>>() }),
+        Record::URI(uri)             => serde_json::json!({ "priority": uri.priority, "weight": uri.weight, "target": lossy(&uri.target) }),
+        Record::Other { bytes, .. }  => serde_json::json!({ "bytes": bytes }),
     }
+}
+
+fn json_dnskey(dnskey: &dns::record::DNSKEY) -> JsonValue {
+    let mut data = serde_json::json!({
+        "flags": dnskey.flags,
+        "protocol": dnskey.protocol,
+        "algorithm": dnskey.algorithm,
+    });
+    insert_name(&mut data, "algorithm_name", dnskey.algorithm_name());
+    data["public_key"] = dnskey.base64_public_key().into();
+    data
+}
+
+fn json_ds(ds: &dns::record::DS) -> JsonValue {
+    let mut data = serde_json::json!({
+        "key_tag": ds.key_tag,
+        "algorithm": ds.algorithm,
+    });
+    insert_name(&mut data, "algorithm_name", ds.algorithm_name());
+    data["digest_type"] = ds.digest_type.into();
+    insert_name(&mut data, "digest_type_name", ds.digest_type_name());
+    data["digest"] = ds.hex_digest().into();
+    data
+}
+
+fn json_loc(loc: &dns::record::LOC) -> JsonValue {
+    serde_json::json!({
+        "size": loc.size.to_string(),
+        "precision": {
+            "horizontal": loc.horizontal_precision,
+            "vertical": loc.vertical_precision,
+        },
+        "point": {
+            "latitude": loc.latitude.as_ref().map(ToString::to_string),
+            "longitude": loc.longitude.as_ref().map(ToString::to_string),
+            "altitude": loc.altitude.to_string(),
+        },
+    })
+}
+
+fn json_naptr(naptr: &dns::record::NAPTR) -> JsonValue {
+    serde_json::json!({
+        "order": naptr.order,
+        "flags": lossy(&naptr.flags),
+        "service": lossy(&naptr.service),
+        "regex": lossy(&naptr.regex),
+        "replacement": naptr.replacement.to_string(),
+    })
+}
+
+fn json_rrsig(rrsig: &dns::record::RRSIG) -> JsonValue {
+    let mut data = serde_json::json!({
+        "type_covered": rrsig.type_covered,
+    });
+    insert_name(&mut data, "type_covered_name", rrsig.type_covered_name());
+    data["algorithm"] = rrsig.algorithm.into();
+    insert_name(&mut data, "algorithm_name", rrsig.algorithm_name());
+    data["labels"] = rrsig.labels.into();
+    data["original_ttl"] = rrsig.original_ttl.into();
+    data["signature_expiration"] = rrsig.signature_expiration.into();
+    data["signature_inception"] = rrsig.signature_inception.into();
+    data["key_tag"] = rrsig.key_tag.into();
+    data["signer_name"] = rrsig.signer_name.to_string().into();
+    data["signature"] = rrsig.base64_signature().into();
+    data
+}
+
+fn json_sshfp(sshfp: &dns::record::SSHFP) -> JsonValue {
+    serde_json::json!({
+        "algorithm": sshfp.algorithm,
+        "fingerprint_type": sshfp.fingerprint_type,
+        "fingerprint": sshfp.hex_fingerprint(),
+    })
+}
+
+fn json_soa(soa: &dns::record::SOA) -> JsonValue {
+    serde_json::json!({
+        "mname": soa.mname.to_string(),
+        "rname": soa.rname.to_string(),
+        "serial": soa.serial,
+        "refresh": soa.refresh_interval,
+        "retry": soa.retry_interval,
+        "expire": soa.expire_limit,
+        "minimum": soa.minimum_ttl,
+    })
+}
+
+fn json_srv(srv: &dns::record::SRV) -> JsonValue {
+    serde_json::json!({
+        "priority": srv.priority,
+        "weight": srv.weight,
+        "port": srv.port,
+        "target": srv.target.to_string(),
+    })
+}
+
+fn json_tlsa(tlsa: &dns::record::TLSA) -> JsonValue {
+    serde_json::json!({
+        "certificate_usage": tlsa.certificate_usage,
+        "selector": tlsa.selector,
+        "matching_type": tlsa.matching_type,
+        "certificate_data": tlsa.hex_certificate_data(),
+    })
+}
+
+/// Adds a human-readable name to a JSON object, when there is one.
+fn insert_name(object: &mut JsonValue, key: &str, name: Option<&str>) {
+    if let Some(name) = name {
+        object[key] = name.into();
+    }
+}
+
+/// Bytes as a string, with anything that is not UTF-8 replaced.
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 
@@ -737,78 +662,67 @@ struct Ascii<'a>(&'a [u8]);
 
 impl fmt::Display for Ascii<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"")?;
+        f.write_str("\"")?;
 
         for byte in self.0.iter().copied() {
-            if byte < 32 || byte >= 128 {
-                write!(f, "\\{}", byte)?;
-            }
-            else if byte == b'"' {
-                write!(f, "\\\"")?;
-            }
-            else if byte == b'\\' {
-                write!(f, "\\\\")?;
-            }
-            else {
-                write!(f, "{}", byte as char)?;
-            }
+            write_escaped(f, byte)?;
         }
 
-        write!(f, "\"")
+        f.write_str("\"")
     }
 }
 
-
-/// Prints a message describing the “error code” field of a DNS packet. This
-/// happens when the packet was received correctly, but the server indicated
-/// an error.
-pub fn print_error_code(rcode: ErrorCode) {
-    match rcode {
-        ErrorCode::FormatError     => println!("Status: Format Error"),
-        ErrorCode::ServerFailure   => println!("Status: Server Failure"),
-        ErrorCode::NXDomain        => println!("Status: NXDomain"),
-        ErrorCode::NotImplemented  => println!("Status: Not Implemented"),
-        ErrorCode::QueryRefused    => println!("Status: Query Refused"),
-        ErrorCode::BadVersion      => println!("Status: Bad Version"),
-        ErrorCode::Private(num)    => println!("Status: Private Reason ({})", num),
-        ErrorCode::Other(num)      => println!("Status: Other Failure ({})", num),
+/// Writes one byte for `Ascii`: printable ASCII as itself, with quotes and
+/// backslashes escaped, and anything else as a backslash and its number.
+fn write_escaped(f: &mut fmt::Formatter<'_>, byte: u8) -> fmt::Result {
+    match byte {
+        b'"'        => f.write_str("\\\""),
+        b'\\'       => f.write_str("\\\\"),
+        32 ..= 127  => write!(f, "{}", char::from(byte)),
+        _           => write!(f, "\\{byte}"),
     }
 }
+
 
 /// Returns the “phase” of operation where an error occurred. This gets shown
 /// to the user so they can debug what went wrong.
 fn erroneous_phase(error: &TransportError) -> &'static str {
     match error {
-        TransportError::WireError(_)          => "protocol",
-        TransportError::TruncatedResponse     |
-        TransportError::NetworkError(_)       => "network",
-        #[cfg(feature = "with_nativetls")]
-        TransportError::TlsError(_)           |
-        TransportError::TlsHandshakeError(_)  => "tls",
-        #[cfg(feature = "with_rustls")]
-        TransportError::RustlsInvalidDnsNameError(_) => "tls", // TODO: Actually wrong, could be https
+        TransportError::WireError(_)             |
+        TransportError::MismatchedResponse(_)    => "protocol",
+        TransportError::TruncatedResponse        |
+        TransportError::NetworkError(_)          |
+        TransportError::Timeout(_)               => "network",
+        TransportError::InvalidNameserver(_)     => "options",
+        #[cfg(any(feature = "with_tls", feature = "with_https"))]
+        TransportError::TlsError(_)              |
+        TransportError::TlsHandshakeError(_)     => "tls",
         #[cfg(feature = "with_https")]
-        TransportError::HttpError(_)          |
-        TransportError::WrongHttpStatus(_,_)  => "http",
+        TransportError::HttpError(_)             |
+        TransportError::WrongHttpStatus(_,_)     |
+        TransportError::MalformedHttp(_)         => "http",
     }
 }
 
 /// Formats an error into its human-readable message.
 fn error_message(error: TransportError) -> String {
     match error {
-        TransportError::WireError(e)          => wire_error_message(e),
-        TransportError::TruncatedResponse     => "Truncated response".into(),
-        TransportError::NetworkError(e)       => e.to_string(),
-        #[cfg(feature = "with_nativetls")]
-        TransportError::TlsError(e)           => e.to_string(),
-        #[cfg(feature = "with_nativetls")]
-        TransportError::TlsHandshakeError(e)  => e.to_string(),
-        #[cfg(any(feature = "with_rustls"))]
-        TransportError::RustlsInvalidDnsNameError(e) => e.to_string(),
+        TransportError::WireError(e)             => wire_error_message(e),
+        TransportError::TruncatedResponse        => "Truncated response".into(),
+        TransportError::NetworkError(e)          => e.to_string(),
+        TransportError::Timeout(after)           => format!("Timed out after {after:?} waiting for a response"),
+        TransportError::MismatchedResponse(m)    => m.to_string(),
+        TransportError::InvalidNameserver(why)   => why,
+        #[cfg(any(feature = "with_tls", feature = "with_https"))]
+        TransportError::TlsError(e)              => e.to_string(),
+        #[cfg(any(feature = "with_tls", feature = "with_https"))]
+        TransportError::TlsHandshakeError(e)     => e.to_string(),
         #[cfg(feature = "with_https")]
-        TransportError::HttpError(e)          => e.to_string(),
+        TransportError::HttpError(e)             => e.to_string(),
         #[cfg(feature = "with_https")]
-        TransportError::WrongHttpStatus(t,r)  => format!("Nameserver returned HTTP {} ({})", t, r.unwrap_or_else(|| "No reason".into()))
+        TransportError::WrongHttpStatus(t,r)     => format!("Nameserver returned HTTP {} ({})", t, r.unwrap_or_else(|| "No reason".into())),
+        #[cfg(feature = "with_https")]
+        TransportError::MalformedHttp(why)       => why,
     }
 }
 
@@ -820,22 +734,22 @@ fn wire_error_message(error: WireError) -> String {
             "Malformed packet: insufficient data".into()
         }
         WireError::WrongRecordLength { stated_length, mandated_length: MandatedLength::Exactly(len) } => {
-            format!("Malformed packet: record length should be {}, got {}", len, stated_length )
+            format!("Malformed packet: record length should be {len}, got {stated_length}" )
         }
         WireError::WrongRecordLength { stated_length, mandated_length: MandatedLength::AtLeast(len) } => {
-            format!("Malformed packet: record length should be at least {}, got {}", len, stated_length )
+            format!("Malformed packet: record length should be at least {len}, got {stated_length}" )
         }
         WireError::WrongLabelLength { stated_length, length_after_labels } => {
-            format!("Malformed packet: length {} was specified, but read {} bytes", stated_length, length_after_labels)
+            format!("Malformed packet: length {stated_length} was specified, but read {length_after_labels} bytes")
         }
         WireError::TooMuchRecursion(indices) => {
-            format!("Malformed packet: too much recursion: {:?}", indices)
+            format!("Malformed packet: too much recursion: {indices:?}")
         }
         WireError::OutOfBounds(index) => {
-            format!("Malformed packet: out of bounds ({})", index)
+            format!("Malformed packet: out of bounds ({index})")
         }
         WireError::WrongVersion { stated_version, maximum_supported_version } => {
-            format!("Malformed packet: record specifies version {}, expected up to {}", stated_version, maximum_supported_version)
+            format!("Malformed packet: record specifies version {stated_version}, expected up to {maximum_supported_version}")
         }
     }
 }
@@ -861,6 +775,101 @@ mod test {
             authentic_data: false,
             checking_disabled: false,
             error_code: None,
+        }
+    }
+
+    // ============ errors ============
+
+    #[test]
+    fn wire_error_messages() {
+        let cases = [
+            (WireError::IO, "Malformed packet: insufficient data"),
+            (WireError::WrongRecordLength { stated_length: 3, mandated_length: MandatedLength::Exactly(4) },
+             "Malformed packet: record length should be 4, got 3"),
+            (WireError::WrongRecordLength { stated_length: 3, mandated_length: MandatedLength::AtLeast(5) },
+             "Malformed packet: record length should be at least 5, got 3"),
+            (WireError::WrongLabelLength { stated_length: 9, length_after_labels: 11 },
+             "Malformed packet: length 9 was specified, but read 11 bytes"),
+            (WireError::TooMuchRecursion(vec![ 12, 12 ].into_boxed_slice()),
+             "Malformed packet: too much recursion: [12, 12]"),
+            (WireError::OutOfBounds(700), "Malformed packet: out of bounds (700)"),
+            (WireError::WrongVersion { stated_version: 1, maximum_supported_version: 0 },
+             "Malformed packet: record specifies version 1, expected up to 0"),
+        ];
+
+        for (error, message) in cases {
+            let error = TransportError::WireError(error);
+            assert_eq!(erroneous_phase(&error), "protocol");
+            assert_eq!(error_message(error), message);
+        }
+    }
+
+    #[test]
+    fn transport_error_phases_and_messages() {
+        #[allow(unused_mut)]
+        let mut cases = vec![
+            (TransportError::TruncatedResponse, "network", "Truncated response".to_owned()),
+            (TransportError::NetworkError(std::io::ErrorKind::ConnectionRefused.into()), "network", "connection refused".to_owned()),
+            (TransportError::Timeout(Duration::from_millis(1500)), "network", "Timed out after 1.5s waiting for a response".to_owned()),
+            (TransportError::MismatchedResponse(dns::Mismatch::NotAResponse), "protocol", "Received a query, not a response".to_owned()),
+            (TransportError::InvalidNameserver("Invalid nameserver \":53\": it has no host".into()), "options", "Invalid nameserver \":53\": it has no host".to_owned()),
+        ];
+
+        #[cfg(feature = "with_https")]
+        cases.extend([
+            (TransportError::WrongHttpStatus(404, None), "http", "Nameserver returned HTTP 404 (No reason)".to_owned()),
+            (TransportError::MalformedHttp("The response has no Content-Length".into()), "http", "The response has no Content-Length".to_owned()),
+        ]);
+
+        for (error, phase, message) in cases {
+            assert_eq!(erroneous_phase(&error), phase);
+            assert_eq!(error_message(error), message);
+        }
+    }
+
+    #[test]
+    fn status_lines() {
+        let cases = [
+            (ErrorCode::FormatError, "Format Error"),
+            (ErrorCode::ServerFailure, "Server Failure"),
+            (ErrorCode::NXDomain, "NXDomain"),
+            (ErrorCode::NotImplemented, "Not Implemented"),
+            (ErrorCode::QueryRefused, "Query Refused"),
+            (ErrorCode::BadVersion, "Bad Version"),
+            (ErrorCode::Private(3841), "Private Reason (3841)"),
+            (ErrorCode::Other(11), "Other Failure (11)"),
+        ];
+
+        for (code, description) in cases {
+            assert_eq!(error_code_description(code), description);
+        }
+    }
+
+    /// An OPT record only turns up in the answer section of a malformed
+    /// response, but short mode still summarises it.
+    #[test]
+    fn short_summary_of_a_pseudo_record() {
+        let opt = OPT { udp_payload_size: 1232, higher_bits: 0, edns0_version: 0, flags: 0x8000, data: vec![ 1 ] };
+        let answer = Answer::Pseudo { qname: Labels::root(), opt };
+        assert_eq!(answer_summary(TextFormat { format_durations: true }, answer), "1232 0 0 32768 [1]");
+    }
+
+    #[test]
+    fn json_names_of_every_record_type() {
+        let cases = [
+            (RecordType::A, "A"), (RecordType::AAAA, "AAAA"), (RecordType::CAA, "CAA"),
+            (RecordType::CNAME, "CNAME"), (RecordType::DNSKEY, "DNSKEY"), (RecordType::DS, "DS"),
+            (RecordType::EUI48, "EUI48"), (RecordType::EUI64, "EUI64"), (RecordType::HINFO, "HINFO"),
+            (RecordType::LOC, "LOC"), (RecordType::MX, "MX"), (RecordType::NAPTR, "NAPTR"),
+            (RecordType::NS, "NS"), (RecordType::NSEC, "NSEC"), (RecordType::OPENPGPKEY, "OPENPGPKEY"),
+            (RecordType::PTR, "PTR"), (RecordType::RRSIG, "RRSIG"), (RecordType::SOA, "SOA"),
+            (RecordType::SRV, "SRV"), (RecordType::SSHFP, "SSHFP"), (RecordType::TLSA, "TLSA"),
+            (RecordType::TXT, "TXT"), (RecordType::URI, "URI"),
+        ];
+
+        for (record_type, name) in cases {
+            assert_eq!(json_record_type_name(record_type), name);
+            assert_eq!(RecordType::from(record_type.type_number()), record_type);
         }
     }
 
@@ -1210,8 +1219,8 @@ mod test {
             algorithm: 13,
             labels: 2,
             original_ttl: 3600,
-            signature_expiration: 1000000,
-            signature_inception: 999000,
+            signature_expiration: 1_000_000,
+            signature_inception: 999_000,
             key_tag: 2371,
             signer_name: Labels::encode("example.com").unwrap(),
             signature: vec![0xAA, 0xBB, 0xCC, 0xDD],
@@ -1222,8 +1231,8 @@ mod test {
         assert_eq!(j["algorithm_name"], "ECDSAP256SHA256");
         assert_eq!(j["labels"], 2);
         assert_eq!(j["original_ttl"], 3600);
-        assert_eq!(j["signature_expiration"], 1000000);
-        assert_eq!(j["signature_inception"], 999000);
+        assert_eq!(j["signature_expiration"], 1_000_000);
+        assert_eq!(j["signature_inception"], 999_000);
         assert_eq!(j["key_tag"], 2371);
         assert_eq!(j["signer_name"], "example.com.");
         assert_eq!(j["signature"], "qrvM3Q==");
@@ -1246,18 +1255,18 @@ mod test {
         let j = json_record_data(Record::SOA(SOA {
             mname: Labels::encode("ns1.example.com").unwrap(),
             rname: Labels::encode("admin.example.com").unwrap(),
-            serial: 2021010100,
+            serial: 2_021_010_100,
             refresh_interval: 3600,
             retry_interval: 900,
-            expire_limit: 604800,
+            expire_limit: 604_800,
             minimum_ttl: 86400,
         }));
         assert_eq!(j["mname"], "ns1.example.com.");
         assert_eq!(j["rname"], "admin.example.com.");
-        assert_eq!(j["serial"], 2021010100u32);
+        assert_eq!(j["serial"], 2_021_010_100_u32);
         assert_eq!(j["refresh"], 3600);
         assert_eq!(j["retry"], 900);
-        assert_eq!(j["expire"], 604800);
+        assert_eq!(j["expire"], 604_800);
         assert_eq!(j["minimum"], 86400);
     }
 
@@ -1324,20 +1333,20 @@ mod test {
 
     #[test]
     fn json_queries_empty() {
-        let j = json_queries(vec![]);
-        assert_eq!(j.len(), 0);
+        let j = json_queries(&[]);
+        assert_eq!(j.as_array().map_or(0, Vec::len), 0);
     }
 
     #[test]
     fn json_queries_single() {
-        let j = json_queries(vec![
+        let j = json_queries(&[
             Query {
                 qname: Labels::encode("example.com").unwrap(),
                 qclass: QClass::IN,
                 qtype: RecordType::A,
             },
         ]);
-        assert_eq!(j.len(), 1);
+        assert_eq!(j.as_array().map_or(0, Vec::len), 1);
         assert_eq!(j[0]["name"], "example.com.");
         assert_eq!(j[0]["class"], "IN");
         assert_eq!(j[0]["type"], "A");
@@ -1345,7 +1354,7 @@ mod test {
 
     #[test]
     fn json_queries_multiple() {
-        let j = json_queries(vec![
+        let j = json_queries(&[
             Query {
                 qname: Labels::encode("example.com").unwrap(),
                 qclass: QClass::IN,
@@ -1357,7 +1366,7 @@ mod test {
                 qtype: RecordType::AAAA,
             },
         ]);
-        assert_eq!(j.len(), 2);
+        assert_eq!(j.as_array().map_or(0, Vec::len), 2);
         assert_eq!(j[0]["type"], "A");
         assert_eq!(j[1]["type"], "AAAA");
     }
@@ -1374,7 +1383,7 @@ mod test {
                 record: Record::A(A { address: Ipv4Addr::new(93, 184, 216, 34) }),
             },
         ]);
-        assert_eq!(j.len(), 1);
+        assert_eq!(j.as_array().map_or(0, Vec::len), 1);
         assert_eq!(j[0]["name"], "example.com.");
         assert_eq!(j[0]["class"], "IN");
         assert_eq!(j[0]["ttl"], 300);
@@ -1396,7 +1405,7 @@ mod test {
                 },
             },
         ]);
-        assert_eq!(j.len(), 1);
+        assert_eq!(j.as_array().map_or(0, Vec::len), 1);
         assert_eq!(j[0]["type"], "OPT");
         assert_eq!(j[0]["data"]["version"], 0);
     }
@@ -1404,7 +1413,7 @@ mod test {
     #[test]
     fn json_answers_empty() {
         let j = json_answers(vec![]);
-        assert_eq!(j.len(), 0);
+        assert_eq!(j.as_array().map_or(0, Vec::len), 0);
     }
 
     // ============ format_duration_hms tests ============
@@ -1541,10 +1550,10 @@ mod test {
         let r = Record::SOA(SOA {
             mname: Labels::encode("ns1.example.com").unwrap(),
             rname: Labels::encode("admin.example.com").unwrap(),
-            serial: 2021010100,
+            serial: 2_021_010_100,
             refresh_interval: 3600,
             retry_interval: 900,
-            expire_limit: 604800,
+            expire_limit: 604_800,
             minimum_ttl: 86400,
         });
         assert_eq!(tf.record_payload_summary(r),
@@ -1557,10 +1566,10 @@ mod test {
         let r = Record::SOA(SOA {
             mname: Labels::encode("ns1.example.com").unwrap(),
             rname: Labels::encode("admin.example.com").unwrap(),
-            serial: 2021010100,
+            serial: 2_021_010_100,
             refresh_interval: 3600,
             retry_interval: 900,
-            expire_limit: 604800,
+            expire_limit: 604_800,
             minimum_ttl: 86400,
         });
         assert_eq!(tf.record_payload_summary(r),

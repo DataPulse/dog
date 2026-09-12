@@ -1,6 +1,5 @@
 //! Reading strings from the DNS wire protocol.
 
-use std::convert::TryFrom;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -20,13 +19,22 @@ pub struct Labels {
     segments: Vec<(u8, String)>,
 }
 
+/// Converts one label to its ASCII form using UTS 46 processing, as dog has
+/// always applied it: characters outside the STD3 rules are allowed (so
+/// service labels such as `_dmarc` work), a hyphen may not start or end a
+/// label, and the label must fit the DNS length limit.
 #[cfg(feature = "with_idna")]
-fn label_to_ascii(label: &str) -> Result<String, unic_idna::Errors> {
-    let flags = unic_idna::Flags{use_std3_ascii_rules: false, transitional_processing: false, verify_dns_length: true};
-    unic_idna::to_ascii(label, flags)
+fn label_to_ascii(label: &str) -> Result<String, idna::Errors> {
+    use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
+
+    Uts46::new()
+        .to_ascii(label.as_bytes(), AsciiDenyList::EMPTY, Hyphens::CheckFirstLast, DnsLength::Verify)
+        .map(std::borrow::Cow::into_owned)
 }
 
+/// Without IDNA support, labels are used just as they are given.
 #[cfg(not(feature = "with_idna"))]
+#[allow(clippy::unnecessary_wraps)]  // it has the same signature as the IDNA version
 fn label_to_ascii(label: &str) -> Result<String, ()> {
     Ok(label.to_owned())
 }
@@ -51,7 +59,7 @@ impl Labels {
 
             let label_idn = label_to_ascii(label)
                     .map_err(|e| {
-                        warn!("Could not encode label {:?}: {:?}", label, e);
+                        warn!("Could not encode label {label:?}: {e:?}");
                         label
                     })?;
 
@@ -60,7 +68,7 @@ impl Labels {
                     segments.push((length, label_idn));
                 }
                 Err(e) => {
-                    warn!("Could not encode label {:?}: {}", label, e);
+                    warn!("Could not encode label {label:?}: {e}");
                     return Err(label);
                 }
             }
@@ -75,10 +83,18 @@ impl Labels {
     }
 
     /// Returns a new set of labels concatenating two names.
+    #[must_use]
     pub fn extend(&self, other: &Self) -> Self {
         let mut segments = self.segments.clone();
         segments.extend_from_slice(&other.segments);
         Self { segments }
+    }
+
+    /// Whether two names are the same name, as DNS compares them: without
+    /// regard to the case of ASCII letters (RFC 4343).
+    pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
+        self.segments.len() == other.segments.len()
+            && self.segments.iter().zip(&other.segments).all(|((_, a), (_, b))| a.eq_ignore_ascii_case(b))
     }
 }
 
@@ -99,7 +115,7 @@ impl fmt::Display for Labels {
         }
 
         for (_, segment) in &self.segments {
-            write!(f, "{}.", segment)?;
+            write!(f, "{segment}.")?;
         }
 
         Ok(())
@@ -191,7 +207,6 @@ const RECURSION_LIMIT: usize = 8;
 /// recursions to track backtracking positions. Returns the count of bytes
 /// that had to be read to produce the string, including the bytes to signify
 /// backtracking, but not including the bytes read _during_ backtracking.
-#[cfg_attr(feature = "with_mutagen", ::mutagen::mutate)]
 fn read_string_recursive(labels: &mut Labels, c: &mut Cursor<&[u8]>, recursions: &mut Vec<u16>) -> Result<u16, WireError> {
     let mut bytes_read = 0;
 
@@ -210,24 +225,24 @@ fn read_string_recursive(labels: &mut Labels, c: &mut Cursor<&[u8]>, recursions:
             let offset = u16::from_be_bytes([name_one, name_two]);
 
             if recursions.contains(&offset) {
-                warn!("Hit previous offset ({}) decoding string", offset);
+                warn!("Hit previous offset ({offset}) decoding string");
                 return Err(WireError::TooMuchRecursion(recursions.clone().into_boxed_slice()));
             }
 
             recursions.push(offset);
 
             if recursions.len() >= RECURSION_LIMIT {
-                warn!("Hit recursion limit ({}) decoding string", RECURSION_LIMIT);
+                warn!("Hit recursion limit ({RECURSION_LIMIT}) decoding string");
                 return Err(WireError::TooMuchRecursion(recursions.clone().into_boxed_slice()));
             }
 
-            trace!("Backtracking to offset {}", offset);
+            trace!("Backtracking to offset {offset}");
             let new_pos = c.position();
             c.set_position(u64::from(offset));
 
             read_string_recursive(labels, c, recursions)?;
 
-            trace!("Coming back to {}", new_pos);
+            trace!("Coming back to {new_pos}");
             c.set_position(new_pos);
             break;
         }
@@ -243,7 +258,7 @@ fn read_string_recursive(labels: &mut Labels, c: &mut Cursor<&[u8]>, recursions:
                 name_buf.push(c);
             }
 
-            let string = String::from_utf8_lossy(&*name_buf).to_string();
+            let string = String::from_utf8_lossy(&name_buf).to_string();
             labels.segments.push((byte, string));
         }
     }

@@ -27,7 +27,6 @@ impl Wire for NSEC {
     const NAME: &'static str = "NSEC";
     const RR_TYPE: u16 = 47;
 
-    #[cfg_attr(feature = "with_mutagen", ::mutagen::mutate)]
     fn read(stated_length: u16, c: &mut Cursor<&[u8]>) -> Result<Self, WireError> {
         if stated_length < 2 {
             let mandated_length = MandatedLength::AtLeast(2);
@@ -35,15 +34,18 @@ impl Wire for NSEC {
         }
 
         let (next_domain, next_domain_length) = c.read_labels()?;
-        trace!("Parsed next domain -> {:?}", next_domain);
+        trace!("Parsed next domain -> {next_domain:?}");
 
-        let bitmap_length = stated_length - next_domain_length;
+        // A record whose stated length is shorter than its own name is
+        // malformed; subtracting blindly would underflow.
+        let bitmap_length = stated_length.checked_sub(next_domain_length)
+            .ok_or(WireError::WrongLabelLength { stated_length, length_after_labels: next_domain_length })?;
         let mut bitmap_bytes = vec![0_u8; usize::from(bitmap_length)];
         c.read_exact(&mut bitmap_bytes)?;
-        trace!("Parsed type bitmap -> {:#x?}", bitmap_bytes);
+        trace!("Parsed type bitmap -> {bitmap_bytes:#x?}");
 
         let types = parse_type_bitmaps(&bitmap_bytes);
-        trace!("Parsed types -> {:?}", types);
+        trace!("Parsed types -> {types:?}");
 
         Ok(Self { next_domain, types })
     }
@@ -63,19 +65,19 @@ fn parse_type_bitmaps(data: &[u8]) -> Vec<u16> {
     let mut i = 0;
 
     while i + 1 < data.len() {
-        let window = data[i] as u16;
-        let bitmap_len = data[i + 1] as usize;
+        let window = u16::from(data[i]);
+        let bitmap_len = usize::from(data[i + 1]);
         i += 2;
 
         if bitmap_len == 0 || bitmap_len > 32 || i + bitmap_len > data.len() {
             break;
         }
 
-        for (byte_idx, &byte) in data[i..i + bitmap_len].iter().enumerate() {
-            for bit in 0..8 {
+        // At most 255 × 256 + 31 × 8 + 7 = 65535, so this never overflows.
+        for (byte_idx, &byte) in (0_u16 ..).zip(&data[i .. i + bitmap_len]) {
+            for bit in 0 .. 8 {
                 if byte & (0x80 >> bit) != 0 {
-                    let type_num = window * 256 + (byte_idx as u16) * 8 + bit;
-                    types.push(type_num);
+                    types.push(window * 256 + byte_idx * 8 + bit);
                 }
             }
         }
@@ -88,53 +90,15 @@ fn parse_type_bitmaps(data: &[u8]) -> Vec<u16> {
 
 impl NSEC {
 
-    /// Returns human-readable names for the type numbers in this record.
+    /// Returns human-readable names for the type numbers in this record,
+    /// using the RFC 3597 form `TYPEnnn` for types that have no name.
     pub fn type_names(&self) -> Vec<String> {
-        self.types.iter().map(|&t| type_number_to_name(t)).collect()
-    }
-}
-
-/// Maps a record type number to its name.
-fn type_number_to_name(type_num: u16) -> String {
-    match type_num {
-        1 => "A".into(),
-        2 => "NS".into(),
-        5 => "CNAME".into(),
-        6 => "SOA".into(),
-        12 => "PTR".into(),
-        15 => "MX".into(),
-        16 => "TXT".into(),
-        17 => "RP".into(),
-        18 => "AFSDB".into(),
-        25 => "KEY".into(),
-        28 => "AAAA".into(),
-        33 => "SRV".into(),
-        35 => "NAPTR".into(),
-        36 => "KX".into(),
-        37 => "CERT".into(),
-        39 => "DNAME".into(),
-        42 => "APL".into(),
-        43 => "DS".into(),
-        44 => "SSHFP".into(),
-        45 => "IPSECKEY".into(),
-        46 => "RRSIG".into(),
-        47 => "NSEC".into(),
-        48 => "DNSKEY".into(),
-        49 => "DHCID".into(),
-        50 => "NSEC3".into(),
-        51 => "NSEC3PARAM".into(),
-        52 => "TLSA".into(),
-        53 => "SMIMEA".into(),
-        55 => "HIP".into(),
-        59 => "CDS".into(),
-        60 => "CDNSKEY".into(),
-        61 => "OPENPGPKEY".into(),
-        62 => "CSYNC".into(),
-        108 => "EUI48".into(),
-        109 => "EUI64".into(),
-        256 => "URI".into(),
-        257 => "CAA".into(),
-        _ => format!("TYPE{}", type_num),
+        self.types.iter()
+            .map(|&number| match super::registry::record_type_name(number) {
+                Some(name) => name.to_owned(),
+                None       => format!("TYPE{number}"),
+            })
+            .collect()
     }
 }
 
@@ -164,7 +128,7 @@ mod test {
             0x03,        // byte 5: RRSIG(46), NSEC(47)
         ];
 
-        assert_eq!(NSEC::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(NSEC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    NSEC {
                        next_domain: Labels::encode("beta.example.com").unwrap(),
                        types: vec![1, 46, 47],
@@ -187,7 +151,7 @@ mod test {
             0x80,        // byte 2: TXT(16)
         ];
 
-        assert_eq!(NSEC::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(NSEC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    NSEC {
                        next_domain: Labels::encode(".").unwrap(),
                        types: vec![1, 2, 6, 15, 16],
@@ -200,7 +164,7 @@ mod test {
             0x00,  // just a root label, no bitmap
         ];
 
-        assert_eq!(NSEC::read(buf.len() as _, &mut Cursor::new(buf)),
+        assert_eq!(NSEC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)),
                    Err(WireError::WrongRecordLength { stated_length: 1, mandated_length: MandatedLength::AtLeast(2) }));
     }
 

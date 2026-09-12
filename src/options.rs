@@ -129,7 +129,7 @@ impl RequestGenerator {
 impl Inputs {
     fn deduce(matches: getopts::Matches) -> Result<Self, OptionsError> {
         let mut inputs = Self::default();
-        inputs.load_transport_types(&matches);
+        inputs.load_transport_types(&matches)?;
         inputs.load_named_args(&matches)?;
         inputs.load_free_args(matches)?;
         inputs.check_for_missing_nameserver()?;
@@ -137,13 +137,13 @@ impl Inputs {
         Ok(inputs)
     }
 
-    fn load_transport_types(&mut self, matches: &getopts::Matches) {
+    fn load_transport_types(&mut self, matches: &getopts::Matches) -> Result<(), OptionsError> {
         if matches.opt_present("https") {
-            self.transport_types.push(TransportType::HTTPS);
+            self.transport_types.push(Self::https_transport()?);
         }
 
         if matches.opt_present("tls") {
-            self.transport_types.push(TransportType::TLS);
+            self.transport_types.push(Self::tls_transport()?);
         }
 
         if matches.opt_present("tcp") {
@@ -153,6 +153,30 @@ impl Inputs {
         if matches.opt_present("udp") {
             self.transport_types.push(TransportType::UDP);
         }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "with_tls")]
+    #[allow(clippy::unnecessary_wraps)]  // it fails when TLS is compiled out
+    fn tls_transport() -> Result<TransportType, OptionsError> {
+        Ok(TransportType::TLS)
+    }
+
+    #[cfg(not(feature = "with_tls"))]
+    fn tls_transport() -> Result<TransportType, OptionsError> {
+        Err(OptionsError::FeatureDisabled { flag: "--tls", protocol: "TLS" })
+    }
+
+    #[cfg(feature = "with_https")]
+    #[allow(clippy::unnecessary_wraps)]  // it fails when HTTPS is compiled out
+    fn https_transport() -> Result<TransportType, OptionsError> {
+        Ok(TransportType::HTTPS)
+    }
+
+    #[cfg(not(feature = "with_https"))]
+    fn https_transport() -> Result<TransportType, OptionsError> {
+        Err(OptionsError::FeatureDisabled { flag: "--https", protocol: "HTTPS" })
     }
 
     fn load_named_args(&mut self, matches: &getopts::Matches) -> Result<(), OptionsError> {
@@ -161,18 +185,7 @@ impl Inputs {
         }
 
         for record_name in matches.opt_strs("type") {
-            if record_name.eq_ignore_ascii_case("OPT") {
-                return Err(OptionsError::QueryTypeOPT);
-            }
-            else if let Some(record_type) = RecordType::from_type_name(&record_name) {
-                self.add_type(record_type);
-            }
-            else if let Ok(type_number) = record_name.parse::<u16>() {
-                self.record_types.push(RecordType::from(type_number));
-            }
-            else {
-                return Err(OptionsError::InvalidQueryType(record_name));
-            }
+            self.add_named_type(record_name)?;
         }
 
         for ns in matches.opt_strs("nameserver") {
@@ -180,24 +193,49 @@ impl Inputs {
         }
 
         for class_name in matches.opt_strs("class") {
-            if let Some(class) = parse_class_name(&class_name) {
-                self.add_class(class);
-            }
-            else if let Ok(class_number) = class_name.parse() {
-                self.add_class(QClass::Other(class_number));
-            }
-            else {
-                return Err(OptionsError::InvalidQueryClass(class_name));
-            }
+            self.add_named_class(class_name)?;
         }
 
         Ok(())
     }
 
+    /// Adds a type given with `--type`, by name or by number.
+    fn add_named_type(&mut self, record_name: String) -> Result<(), OptionsError> {
+        if record_name.eq_ignore_ascii_case("OPT") {
+            Err(OptionsError::QueryTypeOPT)
+        }
+        else if let Some(record_type) = RecordType::from_type_name(&record_name) {
+            self.add_type(record_type);
+            Ok(())
+        }
+        else if let Ok(type_number) = record_name.parse::<u16>() {
+            self.add_type(RecordType::from(type_number));
+            Ok(())
+        }
+        else {
+            Err(OptionsError::InvalidQueryType(record_name))
+        }
+    }
+
+    /// Adds a class given with `--class`, by name or by number.
+    fn add_named_class(&mut self, class_name: String) -> Result<(), OptionsError> {
+        if let Some(class) = parse_class_name(&class_name) {
+            self.add_class(class);
+            Ok(())
+        }
+        else if let Ok(class_number) = class_name.parse() {
+            self.add_class(QClass::Other(class_number));
+            Ok(())
+        }
+        else {
+            Err(OptionsError::InvalidQueryClass(class_name))
+        }
+    }
+
     fn load_free_args(&mut self, matches: getopts::Matches) -> Result<(), OptionsError> {
         for argument in matches.free {
             if let Some(nameserver) = argument.strip_prefix('@') {
-                trace!("Got nameserver -> {:?}", nameserver);
+                trace!("Got nameserver -> {nameserver:?}");
                 self.add_nameserver(nameserver);
             }
             else if is_constant_name(&argument) {
@@ -226,13 +264,21 @@ impl Inputs {
         Ok(())
     }
 
+    /// Checks the nameservers given against the transports asked for, so a
+    /// nameserver that can’t be used is refused before anything is sent.
     fn check_for_missing_nameserver(&self) -> Result<(), OptionsError> {
+        #[cfg(feature = "with_https")]
         if self.resolver_types.is_empty() && self.transport_types == [TransportType::HTTPS] {
-            Err(OptionsError::MissingHttpsUrl)
+            return Err(OptionsError::MissingHttpsUrl);
         }
-        else {
-            Ok(())
+
+        let transports = if self.transport_types.is_empty() { &[ TransportType::Automatic ][..] } else { &self.transport_types };
+        let nameservers = self.resolver_types.iter().filter_map(|r| if let ResolverType::Specific(ns) = r { Some(ns) } else { None });
+        for nameserver in nameservers {
+            check_nameserver(transports, nameserver)?;
         }
+
+        Ok(())
     }
 
     fn load_fallbacks(&mut self) {
@@ -277,10 +323,7 @@ impl Inputs {
 }
 
 fn is_constant_name(argument: &str) -> bool {
-    let first_char = match argument.chars().next() {
-        Some(c)  => c,
-        None     => return false,
-    };
+    let Some(first_char) = argument.chars().next() else { return false };
 
     if ! first_char.is_ascii_alphabetic() {
         return false;
@@ -302,6 +345,16 @@ fn parse_class_name(input: &str) -> Option<QClass> {
     else {
         None
     }
+}
+
+/// Checks that a nameserver can be used with every transport asked for.
+fn check_nameserver(transports: &[TransportType], nameserver: &str) -> Result<(), OptionsError> {
+    for transport in transports {
+        transport.check_nameserver(nameserver)
+            .map_err(|invalid| OptionsError::InvalidNameserver(invalid.to_string()))?;
+    }
+
+    Ok(())
 }
 
 
@@ -328,7 +381,7 @@ fn parse_dec_or_hex(input: &str) -> Option<u16> {
                 Some(num)
             }
             Err(e) => {
-                warn!("Error parsing hex number: {}", e);
+                warn!("Error parsing hex number: {e}");
                 None
             }
         }
@@ -339,7 +392,7 @@ fn parse_dec_or_hex(input: &str) -> Option<u16> {
                 Some(num)
             }
             Err(e) => {
-                warn!("Error parsing number: {}", e);
+                warn!("Error parsing number: {e}");
                 None
             }
         }
@@ -372,7 +425,7 @@ impl UseColours {
             "always"    | "yes"        => Self::Always,
             "never"     | "no"         => Self::Never,
             otherwise => {
-                warn!("Unknown colour setting {:?}", otherwise);
+                warn!("Unknown colour setting {otherwise:?}");
                 Self::Automatic
             },
         }
@@ -431,7 +484,7 @@ impl ProtocolTweaks {
                                 continue;
                             }
                             Err(e) => {
-                                warn!("Failed to parse buffer size: {}", e);
+                                warn!("Failed to parse buffer size: {e}");
                             }
                         }
                     }
@@ -489,20 +542,48 @@ pub enum OptionsError {
     InvalidTxid(String),
     InvalidTweak(String),
     QueryTypeOPT,
+    #[cfg(feature = "with_https")]
     MissingHttpsUrl,
+
+    /// A nameserver cannot be used with a transport that was asked for,
+    /// with the reason why.
+    InvalidNameserver(String),
+
+    /// A protocol was asked for that this build of dog was compiled
+    /// without, with the flag that asked for it.
+    #[cfg(any(not(feature = "with_tls"), not(feature = "with_https")))]
+    FeatureDisabled { flag: &'static str, protocol: &'static str },
+}
+
+impl OptionsError {
+
+    /// The message dog prints for this error, after its own name.
+    pub fn report(&self) -> String {
+        match self {
+            #[cfg(any(not(feature = "with_tls"), not(feature = "with_https")))]
+            Self::FeatureDisabled { .. } => self.to_string(),
+            _ => format!("Invalid options: {self}"),
+        }
+    }
 }
 
 impl fmt::Display for OptionsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidDomain(domain)  => write!(f, "Invalid domain {:?}", domain),
-            Self::InvalidEDNS(edns)      => write!(f, "Invalid EDNS setting {:?}", edns),
-            Self::InvalidQueryType(qt)   => write!(f, "Invalid query type {:?}", qt),
-            Self::InvalidQueryClass(qc)  => write!(f, "Invalid query class {:?}", qc),
-            Self::InvalidTxid(txid)      => write!(f, "Invalid transaction ID {:?}", txid),
-            Self::InvalidTweak(tweak)    => write!(f, "Invalid protocol tweak {:?}", tweak),
+            Self::InvalidDomain(domain)  => write!(f, "Invalid domain {domain:?}"),
+            Self::InvalidEDNS(edns)      => write!(f, "Invalid EDNS setting {edns:?}"),
+            Self::InvalidQueryType(qt)   => write!(f, "Invalid query type {qt:?}"),
+            Self::InvalidQueryClass(qc)  => write!(f, "Invalid query class {qc:?}"),
+            Self::InvalidTxid(txid)      => write!(f, "Invalid transaction ID {txid:?}"),
+            Self::InvalidTweak(tweak)    => write!(f, "Invalid protocol tweak {tweak:?}"),
             Self::QueryTypeOPT           => write!(f, "OPT request is sent by default (see -Z flag)"),
+            #[cfg(feature = "with_https")]
             Self::MissingHttpsUrl        => write!(f, "You must pass a URL as a nameserver when using --https"),
+            Self::InvalidNameserver(why) => write!(f, "{why}"),
+            #[cfg(any(not(feature = "with_tls"), not(feature = "with_https")))]
+            Self::FeatureDisabled { flag, protocol } => {
+                write!(f, "Cannot use '{flag}': This version of dog has been compiled without {protocol} support")
+            }
         }
     }
 }
@@ -528,11 +609,20 @@ mod test {
 
     impl OptionsResult {
         fn unwrap(self) -> Options {
-            match self {
-                Self::Ok(o)  => o,
-                _            => panic!("{:?}", self),
-            }
+            match self { Self::Ok(o) => o, other => panic!("{other:?}") }
         }
+    }
+
+    #[test]
+    fn an_empty_argument_is_the_root() {
+        let options = Options::getopts(&[ "" ]).unwrap();
+        assert_eq!(options.requests.inputs.domains, vec![ Labels::root() ]);
+    }
+
+    #[test]
+    fn an_unknown_colour_setting_is_automatic() {
+        assert_eq!(Options::getopts(&[ "--version", "--colour=sometimes" ]),
+                   OptionsResult::Version(UseColours::Automatic));
     }
 
     // help tests
@@ -919,6 +1009,7 @@ mod test {
                    TxidGenerator::Sequence(1234));
     }
 
+    #[cfg(all(feature = "with_tls", feature = "with_https"))]
     #[test]
     fn all_transport_types() {
         use crate::connect::TransportType::*;
@@ -990,10 +1081,35 @@ mod test {
                    OptionsResult::InvalidOptions(OptionsError::InvalidTweak("bufsize=".into())));
     }
 
+    #[cfg(feature = "with_https")]
     #[test]
     fn missing_https_url() {
         assert_eq!(Options::getopts(&[ "--https", "lookup.dog" ]),
                    OptionsResult::InvalidOptions(OptionsError::MissingHttpsUrl));
+    }
+
+    #[test]
+    fn errors_are_reported_as_invalid_options() {
+        assert_eq!(OptionsError::QueryTypeOPT.report(),
+                   "Invalid options: OPT request is sent by default (see -Z flag)");
+    }
+
+    #[cfg(not(feature = "with_tls"))]
+    #[test]
+    fn tls_compiled_out() {
+        let result = Options::getopts(&[ "--tls", "lookup.dog" ]);
+        let error = OptionsError::FeatureDisabled { flag: "--tls", protocol: "TLS" };
+        assert_eq!(error.report(), "Cannot use '--tls': This version of dog has been compiled without TLS support");
+        assert_eq!(result, OptionsResult::InvalidOptions(error));
+    }
+
+    #[cfg(not(feature = "with_https"))]
+    #[test]
+    fn https_compiled_out() {
+        let result = Options::getopts(&[ "--https", "lookup.dog", "@https://example.com/dns-query" ]);
+        let error = OptionsError::FeatureDisabled { flag: "--https", protocol: "HTTPS" };
+        assert_eq!(error.report(), "Cannot use '--https': This version of dog has been compiled without HTTPS support");
+        assert_eq!(result, OptionsResult::InvalidOptions(error));
     }
 
     // opt tests
@@ -1028,7 +1144,7 @@ mod test {
     fn number_parsing() {
         assert_eq!(parse_dec_or_hex("1234"),    Some(1234));
         assert_eq!(parse_dec_or_hex("0x1234"),  Some(0x1234));
-        assert_eq!(parse_dec_or_hex("0xABcd"),  Some(0xABcd));
+        assert_eq!(parse_dec_or_hex("0xABcd"),  Some(0xABCD));
 
         assert_eq!(parse_dec_or_hex("65536"),   None);
         assert_eq!(parse_dec_or_hex("0x65536"), None);

@@ -1,0 +1,23 @@
+== dog -U --colour=never -q google.com -t 16 --class IN --edns disable
+-- status 0
+-- stdout
+-- stderr
+== dog -U --colour=always -q google.com -t 16 --class IN --edns disable
+-- status 0
+-- stdout
+-- stderr
+== dog -U --short -q google.com -t 16 --class IN --edns disable
+-- status 2
+-- stdout
+-- stderr
+No results
+== dog -U --json -q google.com -t 16 --class IN --edns disable
+-- status 0
+-- stdout
+{"responses":[{"flags":{"qr":true,"opcode":"QUERY","aa":false,"tc":true,"rd":true,"ra":true,"ad":false,"cd":false,"rcode":"NOERROR"},"queries":[{"name":"google.com.","class":"IN","type":"TXT"}],"answers":[],"authorities":[],"additionals":[]}]}
+-- stderr
+== dog -U --edns show --colour=never -q google.com -t 16 --class IN --edns disable
+-- status 3
+-- stdout
+-- stderr
+dog: Invalid options: Option 'edns' given more than once

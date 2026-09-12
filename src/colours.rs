@@ -1,7 +1,7 @@
 //! Colours, colour schemes, and terminal styling.
 
-use ansi_term::Style;
-use ansi_term::Color::*;
+use nu_ansi_term::Style;
+use nu_ansi_term::Color::*;
 
 
 /// The **colours** are used to paint the input.
@@ -85,5 +85,62 @@ impl Colours {
     /// This is used when output is not to a terminal.
     pub fn plain() -> Self {
         Self::default()
+    }
+}
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    // These are the escape sequences terminals have always been sent. Changing
+    // the terminal-styling library must not change a byte of them.
+    #[test]
+    fn pretty_palette_escape_sequences() {
+        let c = Colours::pretty();
+        let (red, green, yellow, purple, cyan) = ("\x1b[31mx\x1b[0m", "\x1b[32mx\x1b[0m", "\x1b[33mx\x1b[0m", "\x1b[35mx\x1b[0m", "\x1b[36mx\x1b[0m");
+        let cases = [
+            ("qname", c.qname, "\x1b[1;34mx\x1b[0m"),
+            ("answer", c.answer, "x"),
+            ("authority", c.authority, cyan),
+            ("additional", c.additional, green),
+            ("a", c.a, "\x1b[1;32mx\x1b[0m"),
+            ("aaaa", c.aaaa, "\x1b[1;32mx\x1b[0m"),
+            ("caa", c.caa, red),
+            ("cname", c.cname, yellow),
+            ("dnskey", c.dnskey, purple),
+            ("ds", c.ds, purple),
+            ("eui48", c.eui48, yellow),
+            ("eui64", c.eui64, "\x1b[1;33mx\x1b[0m"),
+            ("hinfo", c.hinfo, yellow),
+            ("loc", c.loc, yellow),
+            ("mx", c.mx, cyan),
+            ("naptr", c.naptr, green),
+            ("ns", c.ns, red),
+            ("nsec", c.nsec, purple),
+            ("openpgpkey", c.openpgpkey, cyan),
+            ("opt", c.opt, purple),
+            ("ptr", c.ptr, red),
+            ("rrsig", c.rrsig, purple),
+            ("sshfp", c.sshfp, cyan),
+            ("soa", c.soa, purple),
+            ("srv", c.srv, cyan),
+            ("tlsa", c.tlsa, yellow),
+            ("txt", c.txt, yellow),
+            ("uri", c.uri, yellow),
+            ("unknown", c.unknown, "\x1b[41;37mx\x1b[0m"),
+        ];
+
+        for (field, style, expected) in cases {
+            assert_eq!(style.paint("x").to_string(), expected, "{field}");
+        }
+    }
+
+    #[test]
+    fn plain_palette_has_no_escapes() {
+        let c = Colours::plain();
+        for style in [ c.qname, c.answer, c.a, c.opt, c.unknown ] {
+            assert_eq!(style.paint("x").to_string(), "x");
+        }
     }
 }

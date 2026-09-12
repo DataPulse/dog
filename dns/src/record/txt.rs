@@ -25,7 +25,6 @@ impl Wire for TXT {
     const NAME: &'static str = "TXT";
     const RR_TYPE: u16 = 16;
 
-    #[cfg_attr(feature = "with_mutagen", ::mutagen::mutate)]
     fn read(stated_length: u16, c: &mut Cursor<&[u8]>) -> Result<Self, WireError> {
         let mut messages = Vec::new();
         let mut total_length = 0_u16;
@@ -36,7 +35,7 @@ impl Wire for TXT {
             loop {
                 let next_length = c.read_u8()?;
                 total_length += u16::from(next_length) + 1;
-                trace!("Parsed slice length -> {:?} (total so far {:?})", next_length, total_length);
+                trace!("Parsed slice length -> {next_length:?} (total so far {total_length:?})");
 
                 for _ in 0 .. next_length {
                     buf.push(c.read_u8()?);
@@ -71,7 +70,7 @@ impl Wire for TXT {
             Ok(Self { messages })
         }
         else {
-            warn!("Length is incorrect (stated length {:?}, messages length {:?})", stated_length, total_length);
+            warn!("Length is incorrect (stated length {stated_length:?}, messages length {total_length:?})");
             Err(WireError::WrongLabelLength { stated_length, length_after_labels: total_length })
         }
     }
@@ -90,7 +89,7 @@ mod test {
             0x74, 0x78, 0x74, 0x20, 0x6d, 0x65,  // message chunk
         ];
 
-        assert_eq!(TXT::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(TXT::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    TXT {
                        messages: vec![ Box::new(*b"txt me") ],
                    });
@@ -128,7 +127,7 @@ mod test {
             0x41, 0x41, 0x41, 0x41,  // four more ‘A’s (the scream abruptly stops)
         ];
 
-        assert_eq!(TXT::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(TXT::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    TXT {
                        messages: vec![
                            Box::new(*b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
@@ -175,7 +174,7 @@ mod test {
             0x42,  // exactly two hundred and fifty four ‘B’s (a hive)
         ];
 
-        assert_eq!(TXT::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(TXT::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    TXT {
                        messages: vec![
                            Box::new(*b"BBBBBBBBBBBBBBBBBBBBBBBBBBBBB\
@@ -200,7 +199,7 @@ mod test {
             0x79, 0x61, 0x20, 0x62, 0x65, 0x62,  // message chunk
         ];
 
-        assert_eq!(TXT::read(buf.len() as _, &mut Cursor::new(buf)).unwrap(),
+        assert_eq!(TXT::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    TXT {
                        messages: vec![
                            Box::new(*b"txt me"),
