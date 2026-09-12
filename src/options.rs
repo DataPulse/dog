@@ -79,7 +79,10 @@ impl Options {
             Err(e) => return OptionsResult::InvalidOptionsFormat(e),
         };
 
-        let uc = UseColours::deduce(&matches);
+        let uc = match UseColours::deduce(&matches) {
+            Ok(uc) => uc,
+            Err(e) => return OptionsResult::InvalidOptions(e),
+        };
 
         if matches.opt_present("version") {
             OptionsResult::Version(uc)
@@ -88,7 +91,7 @@ impl Options {
             OptionsResult::Help(HelpReason::Flag, uc)
         }
         else {
-            match Self::deduce(matches) {
+            match Self::deduce(matches, uc) {
                 Ok(opts) => {
                     if opts.requests.inputs.domains.is_empty() {
                         OptionsResult::Help(HelpReason::NoDomains, uc)
@@ -104,9 +107,9 @@ impl Options {
         }
     }
 
-    fn deduce(matches: getopts::Matches) -> Result<Self, OptionsError> {
+    fn deduce(matches: getopts::Matches, use_colours: UseColours) -> Result<Self, OptionsError> {
         let measure_time = matches.opt_present("time");
-        let format = OutputFormat::deduce(&matches);
+        let format = OutputFormat::deduce(&matches, use_colours);
         let requests = RequestGenerator::deduce(matches)?;
 
         Ok(Self { requests, measure_time, format })
@@ -119,6 +122,7 @@ impl RequestGenerator {
         let edns = UseEDNS::deduce(&matches)?;
         let txid_generator = TxidGenerator::deduce(&matches)?;
         let protocol_tweaks = ProtocolTweaks::deduce(&matches)?;
+        protocol_tweaks.check_edns(edns)?;
         let inputs = Inputs::deduce(matches)?;
 
         Ok(Self { inputs, txid_generator, edns, protocol_tweaks })
@@ -199,17 +203,14 @@ impl Inputs {
         Ok(())
     }
 
-    /// Adds a type given with `--type`, by name or by number.
+    /// Adds a type given with `--type`: by name, in the generic form such as
+    /// `TYPE65`, or as a number.
     fn add_named_type(&mut self, record_name: String) -> Result<(), OptionsError> {
         if record_name.eq_ignore_ascii_case("OPT") {
             Err(OptionsError::QueryTypeOPT)
         }
-        else if let Some(record_type) = RecordType::from_type_name(&record_name) {
+        else if let Some(record_type) = parse_type(&record_name).or_else(|| number(&record_name).map(RecordType::from)) {
             self.add_type(record_type);
-            Ok(())
-        }
-        else if let Ok(type_number) = record_name.parse::<u16>() {
-            self.add_type(RecordType::from(type_number));
             Ok(())
         }
         else {
@@ -217,14 +218,13 @@ impl Inputs {
         }
     }
 
-    /// Adds a class given with `--class`, by name or by number.
+    /// Adds a class given with `--class`: by name, in the generic form such
+    /// as `CLASS3`, or as a number. A class with a name is the same class
+    /// however it is given; before, `--class 1` was not IN, and the answer,
+    /// which is for IN, was thrown away as answering some other question.
     fn add_named_class(&mut self, class_name: String) -> Result<(), OptionsError> {
-        if let Some(class) = parse_class_name(&class_name) {
+        if let Some(class) = parse_class(&class_name).or_else(|| number(&class_name).map(QClass::from_u16)) {
             self.add_class(class);
-            Ok(())
-        }
-        else if let Ok(class_number) = class_name.parse() {
-            self.add_class(QClass::Other(class_number));
             Ok(())
         }
         else {
@@ -239,26 +239,35 @@ impl Inputs {
                 self.add_nameserver(nameserver);
             }
             else if is_constant_name(&argument) {
-                if argument.eq_ignore_ascii_case("OPT") {
-                    return Err(OptionsError::QueryTypeOPT);
-                }
-                else if let Some(class) = parse_class_name(&argument) {
-                    trace!("Got qclass -> {:?}", &argument);
-                    self.add_class(class);
-                }
-                else if let Some(record_type) = RecordType::from_type_name(&argument) {
-                    trace!("Got qtype -> {:?}", &argument);
-                    self.add_type(record_type);
-                }
-                else {
-                    trace!("Got single-word domain -> {:?}", &argument);
-                    self.add_domain(&argument)?;
-                }
+                self.add_constant(&argument)?;
             }
             else {
                 trace!("Got domain -> {:?}", &argument);
                 self.add_domain(&argument)?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Adds a plain argument made of letters and digits, which could be a
+    /// class, a type, or a domain of one label, guessed in that order.
+    fn add_constant(&mut self, argument: &str) -> Result<(), OptionsError> {
+        if argument.eq_ignore_ascii_case("OPT") {
+            return Err(OptionsError::QueryTypeOPT);
+        }
+
+        if let Some(class) = parse_class(argument) {
+            trace!("Got qclass -> {argument:?}");
+            self.add_class(class);
+        }
+        else if let Some(record_type) = parse_type(argument) {
+            trace!("Got qtype -> {argument:?}");
+            self.add_type(record_type);
+        }
+        else {
+            trace!("Got single-word domain -> {argument:?}");
+            self.add_domain(argument)?;
         }
 
         Ok(())
@@ -300,13 +309,10 @@ impl Inputs {
     }
 
     fn add_domain(&mut self, input: &str) -> Result<(), OptionsError> {
-        if let Ok(domain) = Labels::encode(input) {
-            self.domains.push(domain);
-            Ok(())
-        }
-        else {
-            Err(OptionsError::InvalidDomain(input.into()))
-        }
+        let domain = Labels::encode(input)
+            .map_err(|e| OptionsError::InvalidDomain { domain: input.into(), reason: e.to_string() })?;
+        self.domains.push(domain);
+        Ok(())
     }
 
     fn add_type(&mut self, rt: RecordType) {
@@ -330,6 +336,29 @@ fn is_constant_name(argument: &str) -> bool {
     }
 
     argument.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// A class by name, or in the generic form of RFC 3597 §5, such as `CLASS3`.
+fn parse_class(input: &str) -> Option<QClass> {
+    parse_class_name(input).or_else(|| generic_number(input, "CLASS").map(QClass::from_u16))
+}
+
+/// A type by name, or in the generic form of RFC 3597 §5, such as `TYPE65`.
+fn parse_type(input: &str) -> Option<RecordType> {
+    RecordType::from_type_name(input).or_else(|| generic_number(input, "TYPE").map(RecordType::from))
+}
+
+/// The number in a generic type or class, such as the 65 of `TYPE65`, with
+/// the word in any case.
+fn generic_number(input: &str, word: &str) -> Option<u16> {
+    let start = input.get(.. word.len())?;
+    if start.eq_ignore_ascii_case(word) { number(&input[word.len() ..]) } else { None }
+}
+
+/// A number made of nothing but digits that fits in 16 bits. Rust’s own
+/// parsing would also take a leading plus sign.
+fn number(input: &str) -> Option<u16> {
+    if ! input.is_empty() && input.bytes().all(|b| b.is_ascii_digit()) { input.parse().ok() } else { None }
 }
 
 fn parse_class_name(input: &str) -> Option<QClass> {
@@ -401,7 +430,7 @@ fn parse_dec_or_hex(input: &str) -> Option<u16> {
 
 
 impl OutputFormat {
-    fn deduce(matches: &getopts::Matches) -> Self {
+    fn deduce(matches: &getopts::Matches, use_colours: UseColours) -> Self {
         if matches.opt_present("short") {
             let summary_format = TextFormat::deduce(matches);
             Self::Short(summary_format)
@@ -410,7 +439,6 @@ impl OutputFormat {
             Self::JSON
         }
         else {
-            let use_colours = UseColours::deduce(matches);
             let summary_format = TextFormat::deduce(matches);
             Self::Text(use_colours, summary_format)
         }
@@ -419,15 +447,19 @@ impl OutputFormat {
 
 
 impl UseColours {
-    fn deduce(matches: &getopts::Matches) -> Self {
-        match matches.opt_str("color").or_else(|| matches.opt_str("colour")).unwrap_or_default().as_str() {
-            "automatic" | "auto" | ""  => Self::Automatic,
-            "always"    | "yes"        => Self::Always,
-            "never"     | "no"         => Self::Never,
-            otherwise => {
-                warn!("Unknown colour setting {otherwise:?}");
-                Self::Automatic
-            },
+
+    /// The setting of `--colour` or `--color`, in any case. A setting dog
+    /// does not know is refused; before, it quietly meant automatic.
+    fn deduce(matches: &getopts::Matches) -> Result<Self, OptionsError> {
+        let Some(setting) = matches.opt_str("color").or_else(|| matches.opt_str("colour")) else {
+            return Ok(Self::Automatic);
+        };
+
+        match setting.to_ascii_lowercase().as_str() {
+            "automatic" | "auto" | ""  => Ok(Self::Automatic),
+            "always"    | "yes"        => Ok(Self::Always),
+            "never"     | "no"         => Ok(Self::Never),
+            _                          => Err(OptionsError::InvalidColour(setting)),
         }
     }
 }
@@ -463,7 +495,9 @@ impl ProtocolTweaks {
         let mut tweaks = Self::default();
 
         for tweak_str in matches.opt_strs("Z") {
-            match &*tweak_str {
+            // The help used to show `-Z=TWEAKS`, and no tweak starts with an
+            // equals sign, so one is taken as part of the option.
+            match tweak_str.strip_prefix('=').unwrap_or(&tweak_str) {
                 "aa" | "authoritative" => {
                     tweaks.set_authoritative_flag = true;
                 }
@@ -477,7 +511,7 @@ impl ProtocolTweaks {
                     tweaks.set_dnssec_ok_flag = true;
                 }
                 otherwise => {
-                    if let Some(remaining_num) = tweak_str.strip_prefix("bufsize=") {
+                    if let Some(remaining_num) = otherwise.strip_prefix("bufsize=") {
                         match remaining_num.parse() {
                             Ok(parsed_bufsize) => {
                                 tweaks.udp_payload_size = Some(parsed_bufsize);
@@ -495,6 +529,24 @@ impl ProtocolTweaks {
         }
 
         Ok(tweaks)
+    }
+
+    /// The DO bit and the buffer size are both sent in the OPT record, so
+    /// asking for either with EDNS turned off asks for something that would
+    /// not be sent; before, dog quietly left it out.
+    fn check_edns(self, edns: UseEDNS) -> Result<(), OptionsError> {
+        if edns.should_send() {
+            Ok(())
+        }
+        else if self.set_dnssec_ok_flag {
+            Err(OptionsError::TweakNeedsEDNS("do"))
+        }
+        else if self.udp_payload_size.is_some() {
+            Err(OptionsError::TweakNeedsEDNS("bufsize"))
+        }
+        else {
+            Ok(())
+        }
     }
 }
 
@@ -535,7 +587,9 @@ pub enum HelpReason {
 /// Something wrong with the combination of options the user has picked.
 #[derive(PartialEq, Debug)]
 pub enum OptionsError {
-    InvalidDomain(String),
+    InvalidDomain { domain: String, reason: String },
+    InvalidColour(String),
+    TweakNeedsEDNS(&'static str),
     InvalidEDNS(String),
     InvalidQueryType(String),
     InvalidQueryClass(String),
@@ -570,7 +624,9 @@ impl OptionsError {
 impl fmt::Display for OptionsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidDomain(domain)  => write!(f, "Invalid domain {domain:?}"),
+            Self::InvalidDomain { domain, reason } => write!(f, "Invalid domain {domain:?}: {reason}"),
+            Self::InvalidColour(colour)  => write!(f, "Invalid colour setting {colour:?} (use always, automatic, or never)"),
+            Self::TweakNeedsEDNS(tweak)  => write!(f, "Protocol tweak {tweak:?} needs EDNS, which --edns disable turns off"),
             Self::InvalidEDNS(edns)      => write!(f, "Invalid EDNS setting {edns:?}"),
             Self::InvalidQueryType(qt)   => write!(f, "Invalid query type {qt:?}"),
             Self::InvalidQueryClass(qc)  => write!(f, "Invalid query class {qc:?}"),
@@ -613,16 +669,89 @@ mod test {
         }
     }
 
+    fn invalid(error: OptionsError) -> OptionsResult {
+        OptionsResult::InvalidOptions(error)
+    }
+
+    /// dog does not query the root unless asked for it by name; an empty
+    /// argument used to ask for it, quietly.
     #[test]
-    fn an_empty_argument_is_the_root() {
-        let options = Options::getopts(&[ "" ]).unwrap();
-        assert_eq!(options.requests.inputs.domains, vec![ Labels::root() ]);
+    fn an_empty_argument_is_not_a_domain() {
+        assert_eq!(Options::getopts(&[ "" ]), invalid(OptionsError::InvalidDomain { domain: String::new(), reason: "it is empty".into() }));
+        assert_eq!(Options::getopts(&[ "." ]).unwrap().requests.inputs.domains, vec![ Labels::root() ]);
     }
 
     #[test]
-    fn an_unknown_colour_setting_is_automatic() {
-        assert_eq!(Options::getopts(&[ "--version", "--colour=sometimes" ]),
-                   OptionsResult::Version(UseColours::Automatic));
+    fn invalid_domains_say_why() {
+        assert_eq!(Options::getopts(&[ "a..b" ]), invalid(OptionsError::InvalidDomain { domain: "a..b".into(), reason: "it has an empty label".into() }));
+        let error = OptionsError::InvalidDomain { domain: "\x1b[31mred".into(), reason: "why".into() };
+        assert_eq!(error.report(), r#"Invalid options: Invalid domain "\u{1b}[31mred": why"#);
+    }
+
+    #[test]
+    fn colour_settings() {
+        let cases = [ ("always", UseColours::Always), ("ALWAYS", UseColours::Always), ("yes", UseColours::Always),
+                      ("Never", UseColours::Never), ("no", UseColours::Never),
+                      ("auto", UseColours::Automatic), ("automatic", UseColours::Automatic), ("", UseColours::Automatic) ];
+        for (setting, expected) in cases {
+            assert_eq!(Options::getopts(&[ "--version", &format!("--colour={setting}") ]), OptionsResult::Version(expected), "{setting:?}");
+        }
+    }
+
+    /// An unknown colour setting used to mean automatic, without a word.
+    #[test]
+    fn an_unknown_colour_setting_is_refused() {
+        assert_eq!(Options::getopts(&[ "--version", "--colour=sometimes" ]), invalid(OptionsError::InvalidColour("sometimes".into())));
+        assert_eq!(Options::getopts(&[ "lookup.dog", "--color", "alwyas" ]), invalid(OptionsError::InvalidColour("alwyas".into())));
+        assert_eq!(OptionsError::InvalidColour("alwyas".into()).to_string(), r#"Invalid colour setting "alwyas" (use always, automatic, or never)"#);
+    }
+
+    /// `--class 1` used to be a class numbered 1 that was not IN, and every
+    /// answer, being for IN, was thrown away as answering something else.
+    #[test]
+    fn numbered_classes_are_the_named_classes() {
+        let options = Options::getopts(&[ "lookup.dog", "--class", "1", "--class", "3", "--class", "4", "--class", "CLASS1", "--class", "class254" ]).unwrap();
+        assert_eq!(options.requests.inputs.classes, vec![ QClass::IN, QClass::CH, QClass::HS, QClass::IN, QClass::Other(254) ]);
+    }
+
+    /// The generic forms of RFC 3597 used to be taken as domains when given
+    /// plainly, and refused by `--type`.
+    #[test]
+    fn generic_types_and_classes() {
+        let options = Options::getopts(&[ "lookup.dog", "TYPE65", "type1", "CLASS3", "-t", "TYPE28" ]).unwrap();
+        assert_eq!(options.requests.inputs.record_types, vec![ RecordType::from(28), RecordType::from(65), RecordType::A ]);
+        assert_eq!(options.requests.inputs.classes, vec![ QClass::CH ]);
+        assert_eq!(options.requests.inputs.domains, vec![ Labels::encode("lookup.dog").unwrap() ]);
+    }
+
+    #[test]
+    fn generic_forms_that_are_not_numbers() {
+        let options = Options::getopts(&[ "TYPEX", "CLASS", "type99999" ]).unwrap();
+        assert_eq!(options.requests.inputs.domains.len(), 3);
+        assert_eq!(options.requests.inputs.record_types, vec![ RecordType::A ]);
+
+        for bad in [ "TYPE+5", "+5", "TYPE", "tÿpe5" ] {
+            assert_eq!(Options::getopts(&[ "lookup.dog", "-t", bad ]), invalid(OptionsError::InvalidQueryType(bad.into())), "{bad}");
+        }
+        assert_eq!(Options::getopts(&[ "lookup.dog", "--class", "CLASS" ]), invalid(OptionsError::InvalidQueryClass("CLASS".into())));
+    }
+
+    /// The help showed `-Z=TWEAKS`, which was refused as the tweak “=do”.
+    #[test]
+    fn tweaks_after_an_equals_sign() {
+        let options = Options::getopts(&[ "dom.ain", "-Z=do", "-Z=bufsize=1232" ]).unwrap();
+        assert!(options.requests.protocol_tweaks.set_dnssec_ok_flag);
+        assert_eq!(options.requests.protocol_tweaks.udp_payload_size, Some(1232));
+    }
+
+    /// The DO bit and the buffer size go in the OPT record, which `--edns
+    /// disable` leaves out; asking for both used to quietly send neither.
+    #[test]
+    fn tweaks_that_need_edns() {
+        assert_eq!(Options::getopts(&[ "dom.ain", "-Z", "do", "--edns", "disable" ]), invalid(OptionsError::TweakNeedsEDNS("do")));
+        assert_eq!(Options::getopts(&[ "dom.ain", "-Z", "bufsize=1232", "--edns", "off" ]), invalid(OptionsError::TweakNeedsEDNS("bufsize")));
+        assert!(matches!(Options::getopts(&[ "dom.ain", "-Z", "aa", "--edns", "disable" ]), OptionsResult::Ok(_)));
+        assert_eq!(OptionsError::TweakNeedsEDNS("do").report(), r#"Invalid options: Protocol tweak "do" needs EDNS, which --edns disable turns off"#);
     }
 
     // help tests

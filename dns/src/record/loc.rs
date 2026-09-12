@@ -21,11 +21,11 @@ pub struct LOC {
 
     /// The diameter of the “circle of error” that this location could be in,
     /// measured in centimetres.
-    pub horizontal_precision: u8,
+    pub horizontal_precision: Size,
 
     /// The amount of vertical space that this location could be in, measured
     /// in centimetres.
-    pub vertical_precision: u8,
+    pub vertical_precision: Size,
 
     /// The latitude of the centre of the sphere. If `None`, the packet
     /// parses, but the position is out of range.
@@ -98,11 +98,11 @@ impl Wire for LOC {
         let size = Size::from_u8(size_bits);
         trace!("Parsed size -> {size_bits:#08b} ({size})");
 
-        let horizontal_precision = c.read_u8()?;
-        trace!("Parsed horizontal precision -> {horizontal_precision:?}");
+        let horizontal_precision = Size::from_u8(c.read_u8()?);
+        trace!("Parsed horizontal precision -> {horizontal_precision}");
 
-        let vertical_precision = c.read_u8()?;
-        trace!("Parsed vertical precision -> {vertical_precision:?}");
+        let vertical_precision = Size::from_u8(c.read_u8()?);
+        trace!("Parsed vertical precision -> {vertical_precision}");
 
         let latitude_num = c.read_u32::<BigEndian>()?;
         let latitude = Position::from_u32(latitude_num, true);
@@ -131,6 +131,13 @@ impl Size {
         let base = input >> 4;
         let power_of_ten = input & 0b_0000_1111;
         Self { base, power_of_ten }
+    }
+
+    /// The size in centimetres: the base times ten to the power. RFC 1876
+    /// allows only 0 to 9 for each; larger ones are still worked out as
+    /// written, which even at their largest fits in 64 bits.
+    pub fn centimetres(self) -> u64 {
+        u64::from(self.base) * 10_u64.pow(u32::from(self.power_of_ten))
     }
 }
 
@@ -189,9 +196,17 @@ impl Altitude {
 }
 
 
+/// Sizes are shown in metres, as dig shows them, with the unit attached to
+/// the number, as the altitude has it.
 impl fmt::Display for Size {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}e{}", self.base, self.power_of_ten)
+        let centimetres = self.centimetres();
+        if centimetres.is_multiple_of(100) {
+            write!(f, "{}m", centimetres / 100)
+        }
+        else {
+            write!(f, "{}.{:02}m", centimetres / 100, centimetres % 100)
+        }
     }
 }
 
@@ -252,8 +267,8 @@ mod test {
         assert_eq!(LOC::read(u16::try_from(buf.len()).unwrap(), &mut Cursor::new(buf)).unwrap(),
                    LOC {
                        size: Size { base: 3, power_of_ten: 2 },
-                       horizontal_precision: 0,
-                       vertical_precision: 0,
+                       horizontal_precision: Size::from_u8(0),
+                       vertical_precision: Size::from_u8(0),
                        latitude:  Position::from_u32(0x_8b_0d_2c_8c, true),
                        longitude: Position::from_u32(0x_7f_f8_fc_a5, false),
                        altitude:  Altitude::from_u32(0x_00_98_96_80),
@@ -325,25 +340,36 @@ mod size_test {
     #[test]
     fn zeroes() {
         assert_eq!(Size::from_u8(0b_0000_0000).to_string(),
-                   String::from("0e0"));
+                   String::from("0m"));
     }
 
     #[test]
     fn ones() {
         assert_eq!(Size::from_u8(0b_0001_0001).to_string(),
-                   String::from("1e1"));
+                   String::from("0.10m"));
+    }
+
+    /// The RFC 1876 defaults, and the values in ckdhr.com’s real LOC record,
+    /// which dig shows as 1m, 10000m and 10m, and 1m, 3000m and 10m.
+    #[test]
+    fn real_sizes() {
+        assert_eq!(Size::from_u8(0x12).to_string(), "1m");
+        assert_eq!(Size::from_u8(0x16).to_string(), "10000m");
+        assert_eq!(Size::from_u8(0x13).to_string(), "10m");
+        assert_eq!(Size::from_u8(0x35).to_string(), "3000m");
+        assert_eq!(Size::from_u8(0x35).centimetres(), 300_000);
     }
 
     #[test]
     fn schfourteen_teen() {
         assert_eq!(Size::from_u8(0b_1110_0011).to_string(),
-                   String::from("14e3"));
+                   String::from("140m"));
     }
 
     #[test]
     fn ones_but_bits_this_time() {
         assert_eq!(Size::from_u8(0b_1111_1111).to_string(),
-                   String::from("15e15"));
+                   String::from("150000000000000m"));
     }
 }
 

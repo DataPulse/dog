@@ -74,6 +74,8 @@ fn edns_tweaks_change_the_opt_record() {
     assert_eq!(opt(&only_query(&[ "-Z", "do", "x.example" ])), Some(&[ 0, 0, 41, 2, 0, 0, 0, 0x80, 0, 0, 0 ][..]));
     assert_eq!(opt(&only_query(&[ "-Z", "dnssec-ok", "x.example" ])), Some(&[ 0, 0, 41, 2, 0, 0, 0, 0x80, 0, 0, 0 ][..]));
     assert_eq!(opt(&only_query(&[ "-Z", "bufsize=1232", "x.example" ])), Some(&[ 0, 0, 41, 4, 0xd0, 0, 0, 0, 0, 0, 0 ][..]));
+    // The help showed `-Z=TWEAKS`, and that form was refused.
+    assert_eq!(opt(&only_query(&[ "-Z=do", "x.example" ])), Some(&[ 0, 0, 41, 2, 0, 0, 0, 0x80, 0, 0, 0 ][..]));
     assert_eq!(opt(&only_query(&[ "--edns", "disable", "x.example" ])), None);
     assert_eq!(opt(&only_query(&[ "--edns", "off", "x.example" ])), None);
     assert!(opt(&only_query(&[ "--edns", "show", "x.example" ])).is_some());
@@ -103,6 +105,16 @@ fn classes_and_types() {
     assert_eq!(tail(&only_query(&[ "CH", "TXT", "x.example" ])), (16, 3));
     assert_eq!(tail(&only_query(&[ "--class", "HS", "x.example" ])), (1, 4));
     assert_eq!(tail(&only_query(&[ "--class", "254", "x.example" ])), (1, 254));
+
+    // A class by number is the class with that name, so the answer, with
+    // the question repeated, is accepted; before, dog timed out waiting.
+    assert_eq!(tail(&only_query(&[ "--class", "3", "x.example" ])), (1, 3));
+
+    // The generic forms of RFC 3597, which used to be taken as a domain
+    // when given plainly, and refused by `-t`.
+    assert_eq!(tail(&only_query(&[ "TYPE65", "x.example" ])), (65, 1));
+    assert_eq!(tail(&only_query(&[ "-t", "TYPE28", "x.example" ])), (28, 1));
+    assert_eq!(tail(&only_query(&[ "CLASS3", "TXT", "x.example" ])), (16, 3));
 }
 
 #[test]

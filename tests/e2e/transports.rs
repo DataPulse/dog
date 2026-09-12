@@ -91,11 +91,27 @@ fn a_tcp_answer_cut_short_is_an_error() {
     assert_eq!((run.status, run.stderr.as_str()), (1, "Error [network]: Truncated response\n"));
 }
 
+/// `--class 1` used to be sent as a class numbered 1 that dog did not think
+/// was IN, so every answer, being for IN, was thrown away as answering some
+/// other question, and the query timed out.
+#[test]
+fn a_numbered_class_is_the_named_class() {
+    let server = mock::udp(Udp::Replay(fixtures::response("a-example")));
+    let run = Run::of(dog().args([ "-U", "--short", "--class", "1", "a-example.lookup.dog" ]).arg(server.at()));
+    assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()), (0, "10.20.30.40\n", ""));
+}
+
+/// Hosts that cannot be hosts used to be looked up anyway, failing with the
+/// system resolver’s message; a URL given to another transport was said to
+/// have a port that was not a number.
 #[test]
 fn nameservers_that_cannot_be_addresses() {
     let cases: &[(&[&str], &str)] = &[
         (&[ "a.example", "@127.0.0.1:dns" ], r#"dog: Invalid options: Invalid nameserver "127.0.0.1:dns": its port is not a number from 0 to 65535"#),
         (&[ "-T", "a.example", "@[::1" ], r#"dog: Invalid options: Invalid nameserver "[::1": its '[' is never closed"#),
+        (&[ "a.example", "@@127.0.0.1:53" ], r#"dog: Invalid options: Invalid nameserver "@127.0.0.1:53": its host is not an IP address or a host name"#),
+        (&[ "a.example", "@127.0.0.1:53:9" ], r#"dog: Invalid options: Invalid nameserver "127.0.0.1:53:9": its host is not an IP address or a host name"#),
+        (&[ "-T", "a.example", "@https://dns.google/dns-query" ], r#"dog: Invalid options: Invalid nameserver "https://dns.google/dns-query": it is a URL, which only DNS-over-HTTPS can use"#),
     ];
 
     for (args, message) in cases {
@@ -135,6 +151,19 @@ mod tls {
         assert!(run.stderr.starts_with("Error [tls]: "), "{}", run.stderr);
     }
 
+    /// A server that sends its answer a byte at a time, each well within the
+    /// timeout, used to hold dog for as long as it went on sending.
+    #[test]
+    fn an_answer_trickled_out_a_byte_at_a_time() {
+        let server = tls::tls(Tls::Dns(Tcp::Trickle(fixtures::response("a-example-tcp"), Duration::from_secs(1))));
+        let started = Instant::now();
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path()).args([ "--tls", "a-example.lookup.dog" ]).arg(server.at()));
+        let elapsed = started.elapsed();
+
+        assert_eq!((run.status, run.stderr.as_str()), (1, "Error [network]: Timed out after 5s waiting for a response\n"));
+        assert!(elapsed >= Duration::from_millis(4500) && elapsed < Duration::from_secs(8), "{elapsed:?}");
+    }
+
     #[test]
     fn a_tls_nameserver_with_a_bad_port() {
         let run = run(&[ "--tls", "a.example", "@127.0.0.1:" ]);
@@ -146,7 +175,7 @@ mod tls {
 #[cfg(feature = "with_https")]
 mod https {
     use super::*;
-    use test_support::mock::Http;
+    use test_support::mock::{Http, Http2};
     use test_support::tls::{self, Tls};
 
     fn url(server: &mock::Server) -> String {
@@ -199,5 +228,46 @@ mod https {
         let run = run(&[ "--https", "a.example", "@https://localhost" ]);
         assert_eq!((run.status, run.stderr.as_str()),
                    (3, "dog: Invalid options: Invalid DNS-over-HTTPS URL \"https://localhost\": it has no path, such as '/dns-query'\n"));
+    }
+
+    /// The path used to go into the request as it was, so a line break in
+    /// it added headers of the user’s choosing.
+    #[test]
+    fn a_url_with_a_line_break() {
+        let run = run(&[ "--https", "a.example", "@https://localhost/x\r\nX-Evil: 1" ]);
+        assert_eq!((run.status, run.stderr.as_str()),
+                   (3, "dog: Invalid options: Invalid DNS-over-HTTPS URL \"https://localhost/x\\r\\nX-Evil: 1\": it contains a space, a control character, or a character that is not ASCII\n"));
+    }
+
+    #[test]
+    fn a_response_trickled_out_a_byte_at_a_time() {
+        let server = tls::tls(Tls::Http(Http::Trickle(fixtures::http_response("doh-google"), Duration::from_secs(1))));
+        let started = Instant::now();
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path()).args([ "--https", "a-example.lookup.dog" ]).arg(url(&server)));
+        let elapsed = started.elapsed();
+
+        assert_eq!((run.status, run.stderr.as_str()), (1, "Error [network]: Timed out after 5s waiting for a response\n"));
+        assert!(elapsed >= Duration::from_millis(4500) && elapsed < Duration::from_secs(8), "{elapsed:?}");
+    }
+
+    /// A server that chooses HTTP/2 gets it. Quad9’s speaks nothing else,
+    /// and used to answer dog’s HTTP/1.1 with “505 HTTP Version Not
+    /// Supported”.
+    #[test]
+    fn dns_over_https_over_http2() {
+        let server = tls::tls(Tls::Http2(Http2::Reply(fixtures::h2_response("doh2-quad9"))));
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path())
+            .args([ "--https", "--short", "a-example.lookup.dog" ]).arg(url(&server)));
+        assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()), (0, "10.20.30.40\n", ""));
+        assert!(server.requests()[0].starts_with(test_support::wire::H2_PREFACE));
+    }
+
+    /// HTTP/2 has no reason phrases, so the status is all there is to say.
+    #[test]
+    fn a_real_http2_error() {
+        let server = tls::tls(Tls::Http2(Http2::Raw(fixtures::h2_response("doh2-google-415"))));
+        let run = Run::of(dog().env("SSL_CERT_FILE", tls::ca_path())
+            .args([ "--https", "a-example.lookup.dog" ]).arg(url(&server)));
+        assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()), (1, "", "Error [http]: Nameserver returned HTTP 415\n"));
     }
 }

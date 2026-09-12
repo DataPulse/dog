@@ -248,6 +248,109 @@ pub fn patch_body_txid(message: &[u8], id: u16) -> Vec<u8> {
 }
 
 
+// ---- HTTP/2 (RFC 9113) ----
+
+/// What every HTTP/2 connection from a client starts with.
+pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Frame types.
+pub const H2_DATA: u8 = 0x0;
+pub const H2_HEADERS: u8 = 0x1;
+pub const H2_RST_STREAM: u8 = 0x3;
+pub const H2_SETTINGS: u8 = 0x4;
+pub const H2_PUSH_PROMISE: u8 = 0x5;
+pub const H2_PING: u8 = 0x6;
+pub const H2_GOAWAY: u8 = 0x7;
+
+/// Frame flags.
+pub const H2_END_STREAM: u8 = 0x1;
+pub const H2_ACK: u8 = 0x1;
+pub const H2_END_HEADERS: u8 = 0x4;
+pub const H2_PADDED: u8 = 0x8;
+pub const H2_PRIORITY: u8 = 0x20;
+
+/// One HTTP/2 frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H2Frame {
+    pub kind: u8,
+    pub flags: u8,
+    pub stream: u32,
+    pub payload: Vec<u8>,
+}
+
+impl H2Frame {
+
+    /// The frame as bytes: its length, type, flags, and stream, then its payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload is too long for a frame’s 24-bit length.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let length = u32::try_from(self.payload.len()).ok().filter(|&len| len < 1 << 24).expect("the payload fits in a frame");
+        let mut bytes = length.to_be_bytes()[1 ..].to_vec();
+        bytes.extend_from_slice(&[ self.kind, self.flags ]);
+        bytes.extend_from_slice(&self.stream.to_be_bytes());
+        bytes.extend_from_slice(&self.payload);
+        bytes
+    }
+}
+
+/// The frames of an HTTP/2 byte stream, after the client’s preface if it
+/// starts with one. A frame cut short at the end is left out.
+pub fn h2_frames(bytes: &[u8]) -> Vec<H2Frame> {
+    let mut at = if bytes.starts_with(H2_PREFACE) { H2_PREFACE.len() } else { 0 };
+    let mut frames = Vec::new();
+    while let Some(head) = bytes.get(at .. at + 9) {
+        let length = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+        let Some(payload) = bytes.get(at + 9 .. at + 9 + length) else { break };
+        let stream = u32::from_be_bytes([ head[5], head[6], head[7], head[8] ]) & 0x7FFF_FFFF;
+        frames.push(H2Frame { kind: head[3], flags: head[4], stream, payload: payload.to_vec() });
+        at += 9 + length;
+    }
+    frames
+}
+
+/// A copy of an HTTP/2 byte stream with each frame passed through `f`, which
+/// returns the frames to put in its place: none to drop it, or several to
+/// add more. The preface, if there is one, is kept.
+pub fn map_h2_frames(bytes: &[u8], f: impl FnMut(H2Frame) -> Vec<H2Frame>) -> Vec<u8> {
+    let preface = if bytes.starts_with(H2_PREFACE) { H2_PREFACE } else { &[] };
+    let frames = h2_frames(bytes).into_iter().flat_map(f).collect::<Vec<_>>();
+    [ preface.to_vec(), frames.iter().flat_map(H2Frame::to_bytes).collect() ].concat()
+}
+
+/// The body sent on stream 1: the payloads of its DATA frames, which must
+/// not be padded.
+pub fn h2_body(bytes: &[u8]) -> Vec<u8> {
+    h2_frames(bytes).into_iter().filter(|f| f.kind == H2_DATA && f.stream == 1).flat_map(|f| f.payload).collect()
+}
+
+/// The transaction ID of the DNS query in an HTTP/2 request’s body.
+pub fn h2_request_txid(request: &[u8]) -> Option<u16> {
+    let body = h2_body(request);
+    (body.len() >= 2).then(|| get_u16(&body, 0))
+}
+
+/// A copy of an HTTP/2 response with the DNS transaction ID at the start of
+/// its body replaced.
+///
+/// # Panics
+///
+/// Panics if no DATA frame on stream 1 is long enough to hold one.
+pub fn h2_patch_body_txid(response: &[u8], id: u16) -> Vec<u8> {
+    let mut patched = false;
+    let out = map_h2_frames(response, |mut frame| {
+        if ! patched && frame.kind == H2_DATA && frame.stream == 1 && frame.payload.len() >= 2 {
+            set_u16(&mut frame.payload, 0, id);
+            patched = true;
+        }
+        vec![ frame ]
+    });
+    assert!(patched, "the response has no DATA frame holding a DNS header");
+    out
+}
+
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -314,5 +417,29 @@ mod test {
         let dropped = map_http_headers(message, |line| (!line.starts_with("Content-Type")).then(|| line.to_owned()));
         assert!(!http_is_dns(&dropped));
         assert!(!http_is_dns(b"HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn h2_helpers() {
+        let settings = H2Frame { kind: H2_SETTINGS, flags: 0, stream: 0, payload: vec![ 0, 2, 0, 0, 0, 0 ] };
+        let data = H2Frame { kind: H2_DATA, flags: H2_END_STREAM, stream: 1, payload: vec![ 0x12, 0x34, 9 ] };
+        let request = [ H2_PREFACE, &settings.to_bytes(), &data.to_bytes() ].concat();
+
+        assert_eq!(h2_frames(&request), [ settings.clone(), data.clone() ]);
+        assert_eq!(h2_frames(&request[.. request.len() - 1]), std::slice::from_ref(&settings));
+        assert_eq!(h2_body(&request), [ 0x12, 0x34, 9 ]);
+        assert_eq!(h2_request_txid(&request), Some(0x1234));
+        assert_eq!(h2_request_txid(H2_PREFACE), None);
+
+        let response = [ settings.to_bytes(), data.to_bytes() ].concat();
+        assert_eq!(h2_body(&h2_patch_body_txid(&response, 0xabcd)), [ 0xab, 0xcd, 9 ]);
+        assert_eq!(map_h2_frames(&request, |frame| vec![ frame ]), request);
+        assert_eq!(map_h2_frames(&response, |_| Vec::new()), b"");
+    }
+
+    #[test]
+    #[should_panic(expected = "no DATA frame holding a DNS header")]
+    fn h2_patching_needs_a_body() {
+        h2_patch_body_txid(&[], 1);
     }
 }

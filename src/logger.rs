@@ -1,12 +1,17 @@
 //! Debug error logging.
 
 use std::ffi::OsStr;
+use std::io::{self, IsTerminal, Write};
 
 use nu_ansi_term::{Color, AnsiString};
 
+use crate::colours;
+use crate::stderr;
+
 
 /// Sets the internal logger, changing the log level based on the value of an
-/// environment variable.
+/// environment variable. The log is coloured only when standard error goes
+/// to a terminal that wants colours.
 pub fn configure<T: AsRef<OsStr>>(ev: Option<T>) {
     let Some(ev) = ev else { return };
 
@@ -22,17 +27,35 @@ pub fn configure<T: AsRef<OsStr>>(ev: Option<T>) {
         log::set_max_level(log::LevelFilter::Debug);
     }
 
-    let result = log::set_logger(GLOBAL_LOGGER);
-    if let Err(e) = result {
-        eprintln!("Failed to initialise logger: {e}");
+    let logger = if colours::terminal_wants_colour(io::stderr().is_terminal()) { &COLOURED } else { &PLAIN };
+    if let Err(e) = log::set_logger(logger) {
+        stderr::line(format_args!("Failed to initialise logger: {e}"));
     }
 }
 
 
 #[derive(Debug)]
-struct Logger;
+struct Logger {
+    colour: bool,
+}
 
-const GLOBAL_LOGGER: &Logger = &Logger;
+static COLOURED: Logger = Logger { colour: true };
+static PLAIN: Logger = Logger { colour: false };
+
+impl Logger {
+
+    /// The line written for a log record.
+    fn line(&self, record: &log::Record<'_>) -> String {
+        if self.colour {
+            let open = Color::Fixed(243).paint("[");
+            let close = Color::Fixed(243).paint("]");
+            format!("{}{} {}{} {}", open, level(record.level()), record.target(), close, record.args())
+        }
+        else {
+            format!("[{} {}] {}", record.level(), record.target(), record.args())
+        }
+    }
+}
 
 impl log::Log for Logger {
     fn enabled(&self, _: &log::Metadata<'_>) -> bool {
@@ -40,15 +63,13 @@ impl log::Log for Logger {
     }
 
     fn log(&self, record: &log::Record<'_>) {
-        let open = Color::Fixed(243).paint("[");
-        let level = level(record.level());
-        let close = Color::Fixed(243).paint("]");
-
-        eprintln!("{}{} {}{} {}", open, level, record.target(), close, record.args());
+        // Logging must never stop dog, and standard error is where a failure
+        // to write would be reported, so a line that cannot be written is lost.
+        drop(writeln!(io::stderr(), "{}", self.line(record)));
     }
 
     fn flush(&self) {
-        // no need to flush with ‘eprintln!’.
+        // each line is written whole, and standard error is not buffered.
     }
 }
 
@@ -97,11 +118,25 @@ mod test {
         log::set_max_level(log::LevelFilter::Off);
     }
 
+    fn with_record(check: impl Fn(&log::Record<'_>)) {
+        let metadata = log::Metadata::builder().level(log::Level::Info).target("dog").build();
+        check(&log::Record::builder().metadata(metadata).args(format_args!("a message")).build());
+    }
+
+    /// When standard error is a pipe or a file, the log has no escape codes
+    /// in it; before, it always had.
+    #[test]
+    fn plain_and_coloured_lines() {
+        with_record(|record| assert_eq!(PLAIN.line(record), "[INFO dog] a message"));
+        with_record(|record| assert_eq!(COLOURED.line(record), "\x1b[38;5;243m[\x1b[0m\x1b[36mINFO\x1b[0m dog\x1b[38;5;243m]\x1b[0m a message"));
+    }
+
     #[test]
     fn the_logger_takes_every_record() {
-        let metadata = log::Metadata::builder().level(log::Level::Info).target("dog").build();
-        assert!(GLOBAL_LOGGER.enabled(&metadata));
-        GLOBAL_LOGGER.log(&log::Record::builder().metadata(metadata).args(format_args!("a message")).build());
-        GLOBAL_LOGGER.flush();
+        with_record(|record| {
+            assert!(PLAIN.enabled(record.metadata()));
+            PLAIN.log(record);
+            PLAIN.flush();
+        });
     }
 }

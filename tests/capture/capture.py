@@ -49,6 +49,20 @@ BIND_PORT = 15353
 USER_AGENT = "dog/0.2.0-pre"
 TIMEOUT = 5.0
 
+# HTTP/2 (RFC 9113), as far as dns-transport/src/h2.rs uses it.
+H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+DATA, HEADERS, RST_STREAM, SETTINGS, PING, GOAWAY = 0x0, 0x1, 0x3, 0x4, 0x6, 0x7
+END_STREAM, ACK, END_HEADERS, PADDED, PRIORITY = 0x1, 0x1, 0x4, 0x8, 0x20
+
+# The :status entries of the HPACK static table (RFC 7541 appendix A).
+STATIC_STATUS = {8: 200, 9: 204, 10: 206, 11: 304, 12: 400, 13: 404, 14: 500}
+
+# The Huffman codes of the digits (RFC 7541 appendix B), as (code, bit length).
+HUFFMAN_DIGITS = {
+    (0b00000, 5): "0", (0b00001, 5): "1", (0b00010, 5): "2", (0b011001, 6): "3", (0b011010, 6): "4",
+    (0b011011, 6): "5", (0b011100, 6): "6", (0b011101, 6): "7", (0b011110, 6): "8", (0b011111, 6): "9",
+}
+
 QTYPES = {
     "A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "PTR": 12, "HINFO": 13, "MX": 15,
     "TXT": 16, "AAAA": 28, "LOC": 29, "SRV": 33, "NAPTR": 35, "OPT": 41,
@@ -84,7 +98,7 @@ class Scenario:
     """One query sent to one server, and what its response should contain."""
     name: str
     tier: int
-    transport: str                     # "udp", "tcp" or "doh"
+    transport: str                     # "udp", "tcp", "doh" (HTTP/1.1) or "doh2" (HTTP/2)
     server: str
     qname: str = ""
     qtype: str = "A"
@@ -99,14 +113,18 @@ class Scenario:
     qdcount: int = 1
     path: str = "/dns-query"
     body: Optional[bytes] = None       # DoH body sent instead of the DNS query
+    content_type: str = "application/dns-message"  # sent with HTTP/2 DoH requests
     expect: Expect = field(default_factory=Expect)
 
     def knobs(self):
-        return ",".join([
+        knobs = [
             f"edns={int(self.edns)}", f"do={int(self.do)}", f"bufsize={self.bufsize}",
             f"version={self.edns_version}", f"rd={int(self.rd)}", f"opcode={self.opcode}",
-            f"qdcount={self.qdcount}", f"path={self.path if self.transport == 'doh' else '-'}",
-        ])
+            f"qdcount={self.qdcount}", f"path={self.path if self.transport.startswith('doh') else '-'}",
+        ]
+        if self.transport == "doh2":
+            knobs.append(f"content-type={self.content_type}")
+        return ",".join(knobs)
 
 
 def public_udp(name, qname, qtype, server="1.1.1.1", **kw):
@@ -123,6 +141,10 @@ def bind(name, qname, qtype, transport="udp", **kw):
 
 def doh(name, host, qname="a-example.lookup.dog", **kw):
     return Scenario(name, 1, "doh", host, qname, "A", port=443, **kw)
+
+
+def doh2(name, host, qname="a-example.lookup.dog", **kw):
+    return Scenario(name, 1, "doh2", host, qname, "A", port=443, **kw)
 
 
 def answers(qtype, rcode=NOERROR):
@@ -218,6 +240,15 @@ SCENARIOS = [
     bind("notimp-bind", "a.dogtest.example", "A", opcode=2, expect=Expect(rcode=NOTIMP)),
     bind("version-bind", "version.bind", "TXT", qclass="CH", expect=answers("TXT")),
     bind("hs-class-bind", "a.dogtest.example", "A", qclass="HS", expect=Expect(rcode=REFUSED)),
+
+    # DNS-over-HTTPS over HTTP/2, which a server picks by ALPN, and which
+    # Quad9 insists on. These come last so earlier transaction IDs stay put.
+    doh2("doh2-cloudflare", "cloudflare-dns.com", expect=Expect(http_status=200, answer="A")),
+    doh2("doh2-google", "dns.google", expect=Expect(http_status=200, answer="A")),
+    doh2("doh2-quad9", "dns.quad9.net", expect=Expect(http_status=200, answer="A")),
+    doh2("doh2-google-404", "dns.google", path="/nope", expect=Expect(http_status=404)),
+    doh2("doh2-google-415", "dns.google", content_type="text/plain", expect=Expect(http_status=415)),
+    doh2("doh2-cloudflare-415", "cloudflare-dns.com", content_type="text/plain", expect=Expect(http_status=415)),
 ]
 
 INDEX = {s.name: i for i, s in enumerate(SCENARIOS)}
@@ -341,6 +372,87 @@ def https_exchange(host, port, request):
             return read_http_response(tls)
 
 
+def h2_frame(kind, flags, stream, payload):
+    return struct.pack(">I", len(payload))[1:] + bytes([kind, flags]) + struct.pack(">I", stream) + payload
+
+
+def hpack_integer(value, prefix_bits, flags=0):
+    """An integer with an N-bit prefix (RFC 7541 §5.1)."""
+    limit = (1 << prefix_bits) - 1
+    if value < limit:
+        return bytes([flags | value])
+    out = [flags | limit]
+    value -= limit
+    while value >= 128:
+        out.append(value % 128 | 0x80)
+        value //= 128
+    return bytes(out + [value])
+
+
+def hpack_literal(name_index, value):
+    """A field with its name from the static table and its value literal, not
+    Huffman-coded, and not added to any table (RFC 7541 §6.2.2)."""
+    data = value.encode("ascii")
+    return hpack_integer(name_index, 4) + hpack_integer(len(data), 7) + data
+
+
+def build_h2_request(host, path, body, content_type):
+    """The HTTP/2 request dog's HTTPS transport sends (dns-transport/src/h2.rs):
+    the preface, settings turning off server push, the headers, and the body."""
+    block = bytes([0x83, 0x87])  # :method POST and :scheme https, from the static table
+    for index, value in ((1, host), (4, path), (31, content_type), (19, "application/dns-message"),
+                         (58, USER_AGENT), (28, str(len(body)))):
+        block += hpack_literal(index, value)
+    return (H2_PREFACE + h2_frame(SETTINGS, 0, 0, struct.pack(">HI", 2, 0))
+            + h2_frame(HEADERS, END_HEADERS, 1, block) + h2_frame(DATA, END_STREAM, 1, body))
+
+
+def recv_some(sock):
+    chunk = sock.recv(65536)
+    if not chunk:
+        raise CaptureError("connection closed before the HTTP/2 response ended")
+    return chunk
+
+
+def ends_response(kind, flags, stream):
+    if kind == GOAWAY:
+        return True
+    return stream == 1 and (kind == RST_STREAM or (kind in (HEADERS, DATA) and flags & END_STREAM))
+
+
+def read_h2_response(sock):
+    """Reads frames, answering SETTINGS and PING frames as dog does, and returns
+    every byte the server sent up to the frame that ends the response."""
+    data, offset = b"", 0
+    while True:
+        while len(data) < offset + 9:
+            data += recv_some(sock)
+        length = int.from_bytes(data[offset:offset + 3], "big")
+        kind, flags = data[offset + 3], data[offset + 4]
+        stream = int.from_bytes(data[offset + 5:offset + 9], "big") & 0x7FFFFFFF
+        end = offset + 9 + length
+        while len(data) < end:
+            data += recv_some(sock)
+        if kind == SETTINGS and not flags & ACK:
+            sock.sendall(h2_frame(SETTINGS, ACK, 0, b""))
+        elif kind == PING and not flags & ACK:
+            sock.sendall(h2_frame(PING, ACK, 0, data[offset + 9:end]))
+        if ends_response(kind, flags, stream):
+            return data[:end]
+        offset = end
+
+
+def h2_exchange(host, port, request):
+    context = ssl.create_default_context()
+    context.set_alpn_protocols(["h2"])
+    with socket.create_connection((host, port), timeout=TIMEOUT) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            if tls.selected_alpn_protocol() != "h2":
+                raise CaptureError(f"{host} did not choose HTTP/2")
+            tls.sendall(request)
+            return read_h2_response(tls)
+
+
 # ---- checking responses ----
 
 def skip_name(buf, offset):
@@ -418,6 +530,93 @@ def check_http(s, response, txid):
     return []
 
 
+def h2_frames(data):
+    """Yields (type, flags, stream, payload) for each frame."""
+    offset = 0
+    while offset + 9 <= len(data):
+        length = int.from_bytes(data[offset:offset + 3], "big")
+        stream = int.from_bytes(data[offset + 5:offset + 9], "big") & 0x7FFFFFFF
+        yield data[offset + 3], data[offset + 4], stream, data[offset + 9:offset + 9 + length]
+        offset += 9 + length
+
+
+def h2_content(kind, flags, payload):
+    """A HEADERS or DATA frame's payload without its padding or priority."""
+    pad = 0
+    if flags & PADDED:
+        pad, payload = payload[0], payload[1:]
+    if kind == HEADERS and flags & PRIORITY:
+        payload = payload[5:]
+    return payload[:len(payload) - pad]
+
+
+def hpack_read_integer(block, at, prefix_bits):
+    limit = (1 << prefix_bits) - 1
+    value, at = block[at] & limit, at + 1
+    shift = 0
+    while value >= limit and shift < 64:
+        byte, at = block[at], at + 1
+        value += (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            break
+    return value, at
+
+
+def huffman_digits(raw):
+    out, code, length = "", 0, 0
+    for byte in raw:
+        for i in range(7, -1, -1):
+            code, length = code << 1 | (byte >> i) & 1, length + 1
+            if (code, length) in HUFFMAN_DIGITS:
+                out, code, length = out + HUFFMAN_DIGITS[(code, length)], 0, 0
+    if length >= 8 or code != (1 << length) - 1:
+        raise CaptureError(f"status {raw!r} is not Huffman-coded digits")
+    return out
+
+
+def h2_status(block):
+    """The :status from the start of a header block, and how it was encoded."""
+    at = 0
+    while block[at] & 0xE0 == 0x20:  # dynamic table size updates
+        _, at = hpack_read_integer(block, at, 5)
+    if block[at] & 0x80:
+        index, _ = hpack_read_integer(block, at, 7)
+        return STATIC_STATUS[index], "indexed"
+    index, at = hpack_read_integer(block, at, 6 if block[at] & 0x40 else 4)
+    if index not in STATIC_STATUS:
+        raise CaptureError(f"the first header field (name index {index}) is not :status")
+    huffman = block[at] & 0x80
+    length, at = hpack_read_integer(block, at, 7)
+    raw = block[at:at + length]
+    if huffman:
+        return int(huffman_digits(raw)), "literal, Huffman-coded"
+    return int(raw.decode("ascii")), "literal"
+
+
+def h2_status_and_body(response):
+    """The status of the response on stream 1, and its body."""
+    status, body = None, b""
+    for kind, flags, stream, payload in h2_frames(response):
+        if stream == 1 and kind == HEADERS and status is None:
+            status, how = h2_status(h2_content(kind, flags, payload))
+            print(f"  :status {status} ({how})", file=sys.stderr)
+        elif stream == 1 and kind == DATA:
+            body += h2_content(kind, flags, payload)
+    return status, body
+
+
+def check_h2(s, response, txid):
+    status, body = h2_status_and_body(response)
+    if status is None:
+        return ["no response headers on stream 1"]
+    if s.expect.http_status is not None and status != s.expect.http_status:
+        return [f"HTTP/2 status is {status}, expected {s.expect.http_status}"]
+    if s.expect.answer:
+        return check_dns(s, body, txid)
+    return []
+
+
 # ---- the dig text oracle ----
 
 def dig_flags(s):
@@ -488,11 +687,26 @@ def capture_doh(s, txid, source):
     return manifest_row(s, txid, response, source), []
 
 
+def capture_doh2(s, txid, source):
+    body = s.body if s.body is not None else build_query(s, txid)
+    request = build_h2_request(s.server, s.path, body, s.content_type)
+    response = h2_exchange(s.server, s.port, request)
+    problems = check_h2(s, response, txid)
+    if problems:
+        return None, problems
+    base = FIXTURES / "doh" / s.name
+    write_bytes(base.with_suffix(".request.h2"), request)
+    write_bytes(base.with_suffix(".response.h2"), response)
+    return manifest_row(s, txid, response, source), []
+
+
 def capture_one(s, sources):
     txid = txid_for(s)
     source = sources[s.tier]
     if s.transport == "doh":
         return capture_doh(s, txid, source)
+    if s.transport == "doh2":
+        return capture_doh2(s, txid, source)
     return capture_dns(s, txid, source)
 
 

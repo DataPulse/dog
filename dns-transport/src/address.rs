@@ -1,7 +1,7 @@
 //! Reading the nameserver addresses that users give.
 
 use std::fmt;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 
 
 /// A nameserver address that cannot be used, with the reason why.
@@ -27,9 +27,14 @@ impl From<InvalidAddress> for super::Error {
 ///
 /// # Errors
 ///
-/// Returns an error if there is no host, the port is not a number that fits
-/// in 16 bits, or an IPv6 bracket is not closed.
+/// Returns an error if the address is a URL, there is no host, the host is
+/// neither an IP address nor something that could be a host name, the port
+/// is not a number that fits in 16 bits, or an IPv6 bracket is not closed.
 pub fn parse_host_port(addr: &str, default_port: u16) -> Result<(&str, u16), InvalidAddress> {
+    if addr.contains("://") {
+        return Err(invalid(addr, "it is a URL, which only DNS-over-HTTPS can use"));
+    }
+
     if addr.parse::<Ipv6Addr>().is_ok() {
         return Ok((addr, default_port));
     }
@@ -43,10 +48,22 @@ pub fn parse_host_port(addr: &str, default_port: u16) -> Result<(&str, u16), Inv
         return Err(invalid(addr, "it has no host"));
     }
 
+    if ! is_host(host) {
+        return Err(invalid(addr, "its host is not an IP address or a host name"));
+    }
+
     match port {
         None        => Ok((host, default_port)),
         Some(port)  => port.parse().map(|port| (host, port)).map_err(|_| invalid(addr, "its port is not a number from 0 to 65535")),
     }
+}
+
+/// Whether a host is an IP address, or could be a host name: letters,
+/// digits, hyphens, underscores, and dots. Anything else, such as a second
+/// ‘@’ or a space, would only be looked up as a name that cannot exist.
+fn is_host(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// Splits `[host]:port` or `[host]`, given what follows the `[`.
@@ -80,13 +97,20 @@ pub struct HttpsUrl<'a> {
     pub path: &'a str,
 }
 
-/// Splits a DNS-over-HTTPS URL into its host, port, and path.
+/// Splits a DNS-over-HTTPS URL into its host, port, and path. Any fragment
+/// is left off the path, because it is only for the client (RFC 3986 §3.5).
 ///
 /// # Errors
 ///
-/// Returns an error if the URL is not `https`, has no path, or has an
-/// invalid host or port.
+/// Returns an error if the URL contains anything but printable ASCII, is
+/// not `https`, has no path, has a user name or password, or has an invalid
+/// host or port. The path goes into the HTTP request as it is, so a line
+/// break in it would add headers to the request.
 pub fn parse_https_url(url: &str) -> Result<HttpsUrl<'_>, InvalidAddress> {
+    if ! url.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(invalid_url(url, "it contains a space, a control character, or a character that is not ASCII"));
+    }
+
     let rest = url.strip_prefix("https://")
         .ok_or_else(|| invalid_url(url, "it does not start with 'https://'"))?;
 
@@ -94,9 +118,14 @@ pub fn parse_https_url(url: &str) -> Result<HttpsUrl<'_>, InvalidAddress> {
         .ok_or_else(|| invalid_url(url, "it has no path, such as '/dns-query'"))?;
 
     let (authority, path) = rest.split_at(slash);
+    if authority.contains('@') {
+        return Err(invalid_url(url, "it has a user name or password, which dog cannot send"));
+    }
+
     let (host, port) = parse_host_port(authority, 443)
         .map_err(|_| invalid_url(url, "its host or port is not valid"))?;
 
+    let path = path.split_once('#').map_or(path, |(before, _)| before);
     Ok(HttpsUrl { host, port, path })
 }
 
@@ -138,6 +167,24 @@ mod test {
         assert_eq!(message(parse_host_port("[]:53", 53)), r#"Invalid nameserver "[]:53": it has no host"#);
     }
 
+    /// Each of these used to be looked up as a host name, which failed with
+    /// the system resolver’s message and never said which nameserver it was.
+    #[test]
+    fn hosts_that_cannot_be_hosts() {
+        for addr in [ "@127.0.0.1:53", " 127.0.0.1", "127.0.0.1:53:9", "dns google", "user@dns.google", "bücher.example" ] {
+            assert_eq!(message(parse_host_port(addr, 53)), format!("Invalid nameserver {addr:?}: its host is not an IP address or a host name"));
+        }
+        assert_eq!(parse_host_port("_dns.resolver.arpa", 53).unwrap(), ("_dns.resolver.arpa", 53));
+    }
+
+    /// A URL used with a transport other than HTTPS was said to have a port
+    /// that was not a number, because of the colon in “https://”.
+    #[test]
+    fn urls_are_only_for_https() {
+        assert_eq!(message(parse_host_port("https://dns.google/dns-query", 853)),
+                   r#"Invalid nameserver "https://dns.google/dns-query": it is a URL, which only DNS-over-HTTPS can use"#);
+    }
+
     #[test]
     fn https_urls() {
         assert_eq!(parse_https_url("https://cloudflare-dns.com/dns-query").unwrap(),
@@ -146,6 +193,28 @@ mod test {
                    HttpsUrl { host: "localhost", port: 8443, path: "/" });
         assert_eq!(parse_https_url("https://[::1]:8443/dns-query?x=1").unwrap(),
                    HttpsUrl { host: "::1", port: 8443, path: "/dns-query?x=1" });
+    }
+
+    #[test]
+    fn fragments_are_not_sent() {
+        assert_eq!(parse_https_url("https://dns.google/dns-query#frag").unwrap().path, "/dns-query");
+        assert_eq!(parse_https_url("https://dns.google/a?b=c#d#e").unwrap().path, "/a?b=c");
+    }
+
+    /// The path used to go into the request line as it was, so a line break
+    /// in it added headers of the user’s choosing to the request.
+    #[test]
+    fn urls_with_spaces_or_control_characters() {
+        for url in [ "https://localhost/x\r\nX-Evil: 1", "https://localhost/x\nX-Evil: 1", "https://localhost/dns query", "https://localhost/\t", "https://bücher.example/" ] {
+            assert_eq!(message(parse_https_url(url)),
+                       format!("Invalid DNS-over-HTTPS URL {url:?}: it contains a space, a control character, or a character that is not ASCII"));
+        }
+    }
+
+    #[test]
+    fn urls_with_user_information() {
+        assert_eq!(message(parse_https_url("https://user:pw@dns.google/dns-query")),
+                   r#"Invalid DNS-over-HTTPS URL "https://user:pw@dns.google/dns-query": it has a user name or password, which dog cannot send"#);
     }
 
     #[test]

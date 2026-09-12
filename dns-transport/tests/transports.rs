@@ -130,6 +130,16 @@ mod tcp {
         TcpTransport::with_timeout(server.addr().to_string(), SHORT).send(&a_example())
     }
 
+    /// A server that sent its answer a byte at a time, each well within the
+    /// timeout, used to hold dog for as long as it kept sending, because the
+    /// timeout applied to each read and not to the whole exchange.
+    #[test]
+    fn an_answer_trickled_out_a_byte_at_a_time() {
+        let started = Instant::now();
+        assert_times_out(started, send(Tcp::Trickle(fixtures::response("a-example-tcp"), SHORT / 3)));
+        assert!(started.elapsed() < SHORT * 3, "{:?}", started.elapsed());
+    }
+
     #[test]
     fn a_real_answer() {
         let server = mock::tcp(Tcp::Replay(fixtures::response("a-example-tcp")));

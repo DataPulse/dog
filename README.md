@@ -41,7 +41,7 @@ It has colourful output, understands normal command-line argument syntax, suppor
 
     --edns=SETTING           Whether to OPT in to EDNS (disable, hide, show)
     --txid=NUMBER            Set the transaction ID to a specific value
-    -Z=TWEAKS                Set uncommon protocol-level tweaks
+    -Z TWEAK                 Set a protocol tweak (aa, ad, cd, do, bufsize=NUM)
 
 ### Protocol options
 

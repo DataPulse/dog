@@ -73,6 +73,10 @@ pub enum Udp {
     /// Reply with this response, carrying the query’s transaction ID.
     Replay(Vec<u8>),
 
+    /// Reply with this response, carrying the query’s transaction ID, after
+    /// waiting this long.
+    After(Duration, Vec<u8>),
+
     /// Reply first with a wrong transaction ID, then with the right one.
     WrongTxidThen(Vec<u8>),
 
@@ -103,6 +107,7 @@ impl Udp {
         let id = request_txid(query);
         match self {
             Self::Replay(reply)         => vec![ wire::with_txid(reply, id) ],
+            Self::After(_, reply)       => vec![ wire::with_txid(reply, id) ],
             Self::WrongTxidThen(reply)  => vec![ wire::with_txid(reply, id.wrapping_add(1)), wire::with_txid(reply, id) ],
             Self::OnlyWrongTxid(reply)  => vec![ wire::with_txid(reply, id.wrapping_add(1)) ],
             Self::NotAResponse(reply)   => vec![ wire::without_flag(&wire::with_txid(reply, id), wire::QR) ],
@@ -158,6 +163,9 @@ fn udp_loop(socket: &UdpSocket, mode: &Udp, log: &Log) {
         };
 
         record(log, &buf[.. len]);
+        if let Udp::After(delay, _) = mode {
+            thread::sleep(*delay);
+        }
         for reply in mode.replies(&buf[.. len]) {
             if let Err(e) = socket.send_to(&reply, peer) {
                 eprintln!("mock UDP server: send failed: {e}");
@@ -182,6 +190,10 @@ pub enum Tcp {
 
     /// The correct reply, written one byte at a time.
     Drip(Vec<u8>),
+
+    /// The correct reply, one byte at a time with this long between them,
+    /// as a server trying to hold the client for as long as it can sends it.
+    Trickle(Vec<u8>, Duration),
 
     /// A reply with the wrong transaction ID.
     WrongTxid(Vec<u8>),
@@ -214,16 +226,21 @@ pub enum Tcp {
 /// What to do on a stream after reading the request.
 pub(crate) enum Action {
     Write(Vec<u8>),
-    Drip(Vec<u8>),
+    Trickle(Vec<u8>, Duration),
     Hold,
 }
+
+/// The pause between bytes for the drip modes: long enough that each byte
+/// arrives in a read of its own, short enough to keep tests quick.
+const DRIP: Duration = Duration::from_millis(1);
 
 impl Tcp {
     fn action(&self, query: &[u8]) -> Action {
         let id = request_txid(query);
         match self {
             Self::Replay(reply)               => Action::Write(prefixed(&wire::with_txid(reply, id))),
-            Self::Drip(reply)                 => Action::Drip(prefixed(&wire::with_txid(reply, id))),
+            Self::Drip(reply)                 => Action::Trickle(prefixed(&wire::with_txid(reply, id)), DRIP),
+            Self::Trickle(reply, delay)       => Action::Trickle(prefixed(&wire::with_txid(reply, id)), *delay),
             Self::WrongTxid(reply)            => Action::Write(prefixed(&wire::with_txid(reply, id.wrapping_add(1)))),
             Self::PrefixOnlyThenClose(reply)  => Action::Write(prefixed(reply)[.. 2].to_vec()),
             Self::HalfBodyThenClose(reply)    => Action::Write(half_body(&prefixed(&wire::with_txid(reply, id)))),
@@ -334,17 +351,22 @@ pub(crate) fn prepare(stream: &TcpStream) {
 
 pub(crate) fn perform<S: Read + Write>(stream: &mut S, action: Action) -> io::Result<()> {
     match action {
-        Action::Write(bytes)  => stream.write_all(&bytes).and_then(|()| stream.flush()),
-        Action::Drip(bytes)   => drip(stream, &bytes),
-        Action::Hold          => hold(stream),
+        Action::Write(bytes)           => stream.write_all(&bytes).and_then(|()| stream.flush()),
+        Action::Trickle(bytes, delay)  => trickle(stream, &bytes, delay),
+        Action::Hold                   => hold(stream),
     }
 }
 
-fn drip<S: Write>(stream: &mut S, bytes: &[u8]) -> io::Result<()> {
+/// Writes the bytes one at a time, pausing after each. The client giving up
+/// and closing the connection partway through is what a trickling server
+/// expects to happen sooner or later, so it ends the reply without error.
+fn trickle<S: Write>(stream: &mut S, bytes: &[u8], delay: Duration) -> io::Result<()> {
     for byte in bytes {
-        stream.write_all(std::slice::from_ref(byte))?;
-        stream.flush()?;
-        thread::sleep(Duration::from_millis(1));
+        match stream.write_all(std::slice::from_ref(byte)).and_then(|()| stream.flush()) {
+            Err(e) if matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset) => return Ok(()),
+            result => result?,
+        }
+        thread::sleep(delay);
     }
     Ok(())
 }
@@ -404,6 +426,9 @@ pub enum Http {
     /// As `Reply`, but written one byte at a time.
     Drip(Vec<u8>),
 
+    /// As `Reply`, but one byte at a time with this long between them.
+    Trickle(Vec<u8>, Duration),
+
     /// Exactly these bytes, untouched.
     Raw(Vec<u8>),
 
@@ -414,10 +439,11 @@ pub enum Http {
 impl Http {
     fn action(&self, request: &[u8]) -> Action {
         match self {
-            Self::Reply(reply)  => Action::Write(reply_for(reply, request)),
-            Self::Drip(reply)   => Action::Drip(reply_for(reply, request)),
-            Self::Raw(bytes)    => Action::Write(bytes.clone()),
-            Self::Silent        => Action::Hold,
+            Self::Reply(reply)           => Action::Write(reply_for(reply, request)),
+            Self::Drip(reply)            => Action::Trickle(reply_for(reply, request), DRIP),
+            Self::Trickle(reply, delay)  => Action::Trickle(reply_for(reply, request), *delay),
+            Self::Raw(bytes)             => Action::Write(bytes.clone()),
+            Self::Silent                 => Action::Hold,
         }
     }
 }
@@ -482,6 +508,77 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<Vec<u8>> {
     }
 }
 
+// ---- HTTP/2 ----
+
+/// What an HTTP/2 server does with the request on each connection.
+#[derive(Debug, Clone)]
+pub enum Http2 {
+
+    /// Reply with this response, captured from a real server, with the
+    /// request’s transaction ID written into its body.
+    Reply(Vec<u8>),
+
+    /// Exactly these bytes, untouched.
+    Raw(Vec<u8>),
+}
+
+impl Http2 {
+    fn reply(&self, request: &[u8]) -> Vec<u8> {
+        match (self, wire::h2_request_txid(request)) {
+            (Self::Reply(reply), Some(id)) => wire::h2_patch_body_txid(reply, id),
+            (Self::Reply(bytes) | Self::Raw(bytes), _) => bytes.clone(),
+        }
+    }
+}
+
+/// Starts an HTTP/2 server on an ephemeral loopback port, speaking HTTP/2
+/// from the first byte, as a TLS server does once it has chosen it by ALPN.
+///
+/// # Panics
+///
+/// Panics if the listener cannot be bound.
+pub fn http2(mode: Http2) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback TCP listener");
+    spawn_tcp(listener, move |mut stream, log| {
+        prepare(&stream);
+        serve_http2_stream(&mut stream, &mode, log);
+    })
+}
+
+/// Serves one HTTP/2 exchange on a stream, plain or TLS: reads the client’s
+/// frames until its request is complete, and replies. The connection then
+/// stays open until the client closes it, as a real server’s does, because
+/// the client acknowledges the server’s settings after the reply is sent.
+pub(crate) fn serve_http2_stream<S: Read + Write>(stream: &mut S, mode: &Http2, log: &Log) {
+    let request = match read_h2_request(stream) {
+        Ok(request) => request,
+        Err(e) => {
+            eprintln!("mock HTTP/2 server: could not read the request: {e}");
+            return;
+        }
+    };
+
+    record(log, &request);
+    let reply = mode.reply(&request);
+    if let Err(e) = stream.write_all(&reply).and_then(|()| stream.flush()).and_then(|()| hold(stream)) {
+        eprintln!("mock HTTP/2 server: could not reply: {e}");
+    }
+}
+
+/// Reads until the client has sent a frame that ends stream 1.
+fn read_h2_request<S: Read>(stream: &mut S) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut buf = [0; 4096];
+    while ! wire::h2_frames(&data).iter().any(|f| f.stream == 1 && f.flags & wire::H2_END_STREAM != 0) {
+        let read = stream.read(&mut buf)?;
+        if read == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the client closed before sending a whole request"));
+        }
+        data.extend_from_slice(&buf[.. read]);
+    }
+    Ok(data)
+}
+
 fn content_length(head: &[u8]) -> usize {
     String::from_utf8_lossy(head).lines()
         .filter_map(|line| line.split_once(':'))
@@ -530,6 +627,7 @@ mod test {
         let replies = udp_exchange(&udp(Udp::WrongTxidThen(REPLY.to_vec())), 2);
         assert_eq!((wire::txid(&replies[0]), wire::txid(&replies[1])), (0x1235, 0x1234));
         assert_eq!(wire::txid(&udp_exchange(&udp(Udp::OnlyWrongTxid(REPLY.to_vec())), 1)[0]), 0x1235);
+        assert_eq!(wire::txid(&udp_exchange(&udp(Udp::After(Duration::from_millis(10), REPLY.to_vec())), 1)[0]), 0x1234);
         assert_eq!(wire::flags(&udp_exchange(&udp(Udp::NotAResponse(REPLY.to_vec())), 1)[0]) & wire::QR, 0);
         assert_eq!(udp_exchange(&udp(Udp::Raw(vec![ 1 ])), 1)[0], vec![ 1 ]);
         assert_eq!(udp_exchange(&udp(Udp::RawWithTxid(vec![ 0, 0, 9 ])), 1)[0], vec![ 0x12, 0x34, 9 ]);
@@ -540,6 +638,7 @@ mod test {
     fn tcp_modes() {
         assert_eq!(tcp_exchange(&tcp(Tcp::Replay(REPLY.to_vec()))), prefixed(&wire::with_txid(REPLY, 0x1234)));
         assert_eq!(tcp_exchange(&tcp(Tcp::Drip(REPLY.to_vec()))), prefixed(&wire::with_txid(REPLY, 0x1234)));
+        assert_eq!(tcp_exchange(&tcp(Tcp::Trickle(REPLY.to_vec(), DRIP))), prefixed(&wire::with_txid(REPLY, 0x1234)));
         assert_eq!(tcp_exchange(&tcp(Tcp::PrefixOnlyThenClose(REPLY.to_vec()))), vec![ 0, 12 ]);
         assert_eq!(tcp_exchange(&tcp(Tcp::HalfBodyThenClose(REPLY.to_vec()))).len(), 2 + 6);
         assert_eq!(tcp_exchange(&tcp(Tcp::OneByteThenClose)), vec![ 0 ]);
@@ -610,6 +709,7 @@ mod test {
         for (mode, expected_body) in [
             (Http::Reply(dns_reply.clone()), b"\x12\x34".as_slice()),
             (Http::Drip(dns_reply.clone()), b"\x12\x34".as_slice()),
+            (Http::Trickle(dns_reply.clone(), DRIP), b"\x12\x34".as_slice()),
             (Http::Reply(html_reply.clone()), b"no".as_slice()),
             (Http::Raw(dns_reply.clone()), b"\x00\x00".as_slice()),
         ] {
@@ -621,6 +721,30 @@ mod test {
             assert_eq!(wire::http_body(&reply), expected_body);
             assert_eq!(server.requests(), vec![ request.clone() ]);
         }
+    }
+
+    #[test]
+    fn http2_replies_carry_the_request_txid() {
+        let request = [ wire::H2_PREFACE, &wire::H2Frame { kind: wire::H2_DATA, flags: wire::H2_END_STREAM, stream: 1, payload: QUERY.to_vec() }.to_bytes() ].concat();
+        let reply = wire::H2Frame { kind: wire::H2_DATA, flags: wire::H2_END_STREAM, stream: 1, payload: REPLY.to_vec() }.to_bytes();
+
+        for (mode, expected_txid) in [ (Http2::Reply(reply.clone()), 0x1234), (Http2::Raw(reply.clone()), 0xaaaa) ] {
+            let server = http2(mode);
+            let mut stream = TcpStream::connect(server.addr()).unwrap();
+            stream.write_all(&request[.. 10]).unwrap();
+            stream.write_all(&request[10 ..]).unwrap();
+            let mut received = vec![ 0; reply.len() ];
+            stream.read_exact(&mut received).unwrap();
+            assert_eq!(wire::txid(&wire::h2_body(&received)), expected_txid);
+            assert_eq!(server.requests(), vec![ request.clone() ]);
+        }
+    }
+
+    #[test]
+    fn http2_clients_that_close_early() {
+        let server = http2(Http2::Raw(Vec::new()));
+        drop(TcpStream::connect(server.addr()).unwrap());
+        assert!(server.requests().is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use native_tls::{Certificate, Identity, TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::fixtures;
-use crate::mock::{self, Http, Log, Server, Tcp};
+use crate::mock::{self, Http, Http2, Log, Server, Tcp};
 
 /// The path of the test CA certificate, for `SSL_CERT_FILE`.
 pub fn ca_path() -> PathBuf {
@@ -33,11 +33,14 @@ pub fn connector() -> TlsConnector {
     TlsConnector::builder().add_root_certificate(test_ca()).build().expect("build a TLS connector")
 }
 
-fn acceptor() -> TlsAcceptor {
+/// An acceptor that agrees to the given application protocols (ALPN), if the
+/// client offers them; with none, it chooses none, and the client uses its
+/// default.
+fn acceptor(protocols: &[&str]) -> TlsAcceptor {
     let certificate = fixtures::load("tls/localhost.pem");
     let key = fixtures::load("tls/localhost.key");
     let identity = Identity::from_pkcs8(&certificate, &key).expect("the test identity parses");
-    TlsAcceptor::new(identity).expect("build a TLS acceptor")
+    TlsAcceptor::builder(identity).accept_alpn(protocols).build().expect("build a TLS acceptor")
 }
 
 /// What a TLS server does with each connection.
@@ -49,6 +52,9 @@ pub enum Tls {
 
     /// Complete the handshake, then serve HTTP (DNS-over-HTTPS).
     Http(Http),
+
+    /// Complete the handshake, choosing HTTP/2 by ALPN, then serve HTTP/2.
+    Http2(Http2),
 
     /// Answer the client’s handshake with bytes that are not TLS.
     GarbageHandshake,
@@ -65,7 +71,8 @@ pub enum Tls {
 /// Panics if the listener cannot be bound or the certificates don’t load.
 pub fn tls(mode: Tls) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback TCP listener");
-    let acceptor = acceptor();
+    let protocols: &[&str] = if matches!(mode, Tls::Http2(_)) { &[ "h2" ] } else { &[] };
+    let acceptor = acceptor(protocols);
     mock::spawn_tcp(listener, move |stream, log| handle(stream, &mode, &acceptor, log))
 }
 
@@ -84,6 +91,7 @@ fn handle(mut stream: TcpStream, mode: &Tls, acceptor: &TlsAcceptor, log: &Log) 
         }
         Tls::Dns(tcp) => with_tls(stream, acceptor, |tls| mock::serve_dns_stream(tls, tcp, log)),
         Tls::Http(http) => with_tls(stream, acceptor, |tls| mock::serve_http_stream(tls, http, log)),
+        Tls::Http2(h2) => with_tls(stream, acceptor, |tls| mock::serve_http2_stream(tls, h2, log)),
     }
 }
 
@@ -130,6 +138,21 @@ mod test {
         let mut reply = Vec::new();
         stream.read_to_end(&mut reply).unwrap();
         assert!(reply.starts_with(b"HTTP/1.1 204"));
+    }
+
+    /// A client offering HTTP/2 gets it from an HTTP/2 server, and gets no
+    /// protocol from the others, which leaves it on HTTP/1.1.
+    #[test]
+    fn http2_is_chosen_by_alpn() {
+        let offering = || TlsConnector::builder().add_root_certificate(test_ca()).request_alpns(&[ "h2", "http/1.1" ]).build().unwrap();
+
+        let server = tls(Tls::Http2(Http2::Raw(Vec::new())));
+        let stream = offering().connect("localhost", TcpStream::connect(server.addr()).unwrap()).unwrap();
+        assert_eq!(stream.negotiated_alpn().unwrap().as_deref(), Some(&b"h2"[..]));
+
+        let server = tls(Tls::Http(Http::Silent));
+        let stream = offering().connect("localhost", TcpStream::connect(server.addr()).unwrap()).unwrap();
+        assert_eq!(stream.negotiated_alpn().unwrap(), None);
     }
 
     #[test]

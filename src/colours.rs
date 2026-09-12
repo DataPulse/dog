@@ -40,6 +40,50 @@ pub struct Colours {
     pub unknown: Style,
 }
 
+/// Whether dog should colour what it writes to a stream, if the stream is a
+/// terminal, going by the environment.
+pub fn terminal_wants_colour(is_terminal: bool) -> bool {
+    wants_colour(is_terminal, std::env::var_os("NO_COLOR").as_deref(), std::env::var_os("TERM").as_deref())
+}
+
+/// Whether a stream gets colours: only a terminal does, and not when the
+/// user has set `NO_COLOR` to anything (<https://no-color.org>), nor when
+/// `TERM` says the terminal cannot show them.
+fn wants_colour(is_terminal: bool, no_color: Option<&std::ffi::OsStr>, term: Option<&std::ffi::OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(std::ffi::OsStr::is_empty) && term.is_none_or(|term| term != "dumb")
+}
+
+#[cfg(test)]
+mod wants_colour_test {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_terminals_get_colours() {
+        assert!(wants_colour(true, None, Some(OsStr::new("xterm-256color"))));
+        assert!(wants_colour(true, None, None));
+        assert!(!wants_colour(false, None, Some(OsStr::new("xterm"))));
+    }
+
+    /// `NO_COLOR` set to anything but the empty string turns colours off.
+    #[test]
+    fn no_color() {
+        assert!(!wants_colour(true, Some(OsStr::new("1")), None));
+        assert!(wants_colour(true, Some(OsStr::new("")), None));
+    }
+
+    /// A dumb terminal used to get escape codes it cannot show.
+    #[test]
+    fn dumb_terminals() {
+        assert!(!wants_colour(true, None, Some(OsStr::new("dumb"))));
+    }
+
+    #[test]
+    fn the_environment_is_read() {
+        assert!(!terminal_wants_colour(false));
+    }
+}
+
 impl Colours {
 
     /// Create a new colour palette that has a variety of different styles

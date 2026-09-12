@@ -37,6 +37,7 @@ mod logger;
 mod output;
 mod requests;
 mod resolve;
+mod stderr;
 mod system;
 mod table;
 mod txid;
@@ -82,12 +83,12 @@ fn main() {
         }
 
         OptionsResult::InvalidOptionsFormat(oe) => {
-            eprintln!("dog: Invalid options: {oe}");
+            stderr::line(format_args!("dog: Invalid options: {oe}"));
             exit(exits::OPTIONS_ERROR);
         }
 
         OptionsResult::InvalidOptions(why) => {
-            eprintln!("dog: {}", why.report());
+            stderr::line(format_args!("dog: {}", why.report()));
             exit(exits::OPTIONS_ERROR);
         }
     }
@@ -117,7 +118,7 @@ fn output_failure(error: &io::Error, status_otherwise: i32) -> i32 {
         status_otherwise
     }
     else {
-        eprintln!("dog: Cannot write output: {error}");
+        stderr::line(format_args!("dog: Cannot write output: {error}"));
         exits::SYSTEM_ERROR
     }
 }
@@ -135,7 +136,7 @@ fn run(options: Options, paths: &SystemPaths) -> i32 {
     let request_sets = match requests.generate(paths) {
         Ok(sets) => sets,
         Err(e) => {
-            eprintln!("Unable to obtain resolver: {e}");
+            stderr::line(format_args!("Unable to obtain resolver: {e}"));
             return exits::SYSTEM_ERROR;
         }
     };
@@ -158,7 +159,7 @@ fn warn_about_local_hosts(domains: &[Labels], hosts_path: &Path) {
 
     for domain in domains {
         if local_hosts.contains(domain) {
-            eprintln!("warning: domain '{domain}' also exists in hosts file");
+            stderr::line(format_args!("warning: domain '{domain}' also exists in hosts file"));
         }
     }
 }
@@ -173,6 +174,7 @@ fn send_all(request_sets: Vec<RequestSet>, format: OutputFormat, show_opt: bool)
         let Some(result) = send_until_answered(transport.as_ref(), requests) else { continue };
         match result {
             Ok(mut response) => {
+                warn_if_truncated(&response);
                 if ! show_opt {
                     strip_pseudo_records(&mut response);
                 }
@@ -202,6 +204,16 @@ fn send_until_answered(transport: &dyn Transport, requests: Vec<dns::Request>) -
     }
 
     None
+}
+
+/// Warns that a response was cut short. Only a response over UDP can be, and
+/// the automatic transport asks again over TCP when one is, so this is seen
+/// when UDP alone was asked for; before, dog printed what there was, or
+/// nothing at all, without a word.
+fn warn_if_truncated(response: &Response) {
+    if response.flags.truncated {
+        stderr::line(format_args!("warning: the response was truncated, so records may be missing; use --tcp to get them all"));
+    }
 }
 
 /// Removes OPT pseudo-records, which are only shown when asked for.

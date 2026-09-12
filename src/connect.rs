@@ -51,6 +51,16 @@ impl TransportType {
         }
     }
 
+    /// Creates a transport that sends to the first of the nameservers, and
+    /// on to the next whenever one fails to answer.
+    pub fn make_transport_to(self, nameservers: &[String]) -> Box<dyn Transport> {
+        if let [ nameserver ] = nameservers {
+            return self.make_transport(nameserver.clone());
+        }
+
+        Box::new(FailoverTransport::new(nameservers.iter().map(|nameserver| self.make_transport(nameserver.clone())).collect()))
+    }
+
     /// Checks that a nameserver given on the command line can be used with
     /// this transport: an address with an optional port, or for HTTPS, a
     /// URL. This lets dog reject a bad one before sending anything.
@@ -69,6 +79,42 @@ impl TransportType {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::net::UdpSocket;
+    use test_support::fixtures;
+    use test_support::mock::{self, Udp};
+
+    fn a_example() -> dns::Request {
+        dns::Request {
+            transaction_id: 0x1234,
+            flags: dns::Flags::query(),
+            query: dns::Query {
+                qname: dns::Labels::encode("a-example.lookup.dog").unwrap(),
+                qtype: dns::record::RecordType::A,
+                qclass: dns::QClass::IN,
+            },
+            additional: Some(dns::Request::additional_record()),
+        }
+    }
+
+    fn closed_port() -> String {
+        UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string()
+    }
+
+    /// The system’s nameservers are tried in turn; before, only the first
+    /// was ever used, and if it was down, so was dog.
+    #[test]
+    fn nameservers_are_tried_in_turn() {
+        let working = mock::udp(Udp::Replay(fixtures::response("a-example")));
+        let transport = TransportType::UDP.make_transport_to(&[ closed_port(), working.addr().to_string() ]);
+        assert_eq!(transport.send(&a_example()).unwrap().answers.len(), 1);
+        assert_eq!(working.requests().len(), 1);
+    }
+
+    #[test]
+    fn one_nameserver_is_used_alone() {
+        let transport = TransportType::UDP.make_transport_to(&[ closed_port() ]);
+        assert!(matches!(transport.send(&a_example()), Err(Error::NetworkError(_))));
+    }
 
     #[test]
     fn nameservers() {

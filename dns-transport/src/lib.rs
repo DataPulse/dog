@@ -34,6 +34,9 @@ pub use self::auto::AutoTransport;
 mod error;
 pub use self::error::Error;
 
+mod failover;
+pub use self::failover::FailoverTransport;
+
 mod net;
 
 mod udp;
@@ -51,6 +54,9 @@ pub use self::tls::TlsTransport;
 mod https;
 #[cfg(feature = "with_https")]
 pub use self::https::HttpsTransport;
+
+#[cfg(feature = "with_https")]
+mod h2;
 
 #[cfg(any(feature = "with_tls", feature = "with_https"))]
 mod tls_stream;

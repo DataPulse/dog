@@ -34,20 +34,20 @@ impl ResolverType {
             }
             Self::Specific(nameserver) => {
                 let search_list = Vec::new();
-                Ok(Resolver { nameserver, search_list })
+                Ok(Resolver { nameservers: vec![ nameserver ], search_list })
             }
         }
     }
 }
 
 
-/// A **resolver** knows the address of the server we should
+/// A **resolver** knows the addresses of the servers we should
 /// send DNS requests to, and the search list for name lookup.
 #[derive(Debug)]
 pub struct Resolver {
 
-    /// The address of the nameserver.
-    pub nameserver: String,
+    /// The addresses of the nameservers, in the order to try them.
+    pub nameservers: Vec<String>,
 
     /// The search list for name lookup.
     pub search_list: Vec<String>,
@@ -55,9 +55,10 @@ pub struct Resolver {
 
 impl Resolver {
 
-    /// Returns a nameserver that queries should be sent to.
-    pub fn nameserver(&self) -> String {
-        self.nameserver.clone()
+    /// The nameservers that queries should be sent to, each to be tried if
+    /// the one before it does not answer.
+    pub fn nameservers(&self) -> &[String] {
+        &self.nameservers
     }
 
     /// Returns a sequence of names to be queried, taking into account
@@ -95,9 +96,15 @@ fn system_nameservers(paths: &SystemPaths) -> Result<Resolver, ResolverLookupErr
     parse_resolv_conf(BufReader::new(file))
 }
 
-/// Finds the first IPv4 nameserver, and the last search list, in text in
-/// the `resolv.conf` format. Returns an error if there’s a problem reading
-/// it, or if it specifies no usable nameserver.
+/// How many of the nameservers in `resolv.conf` are used: the same number
+/// as the system’s own resolver uses (glibc’s `MAXNS`).
+#[cfg(unix)]
+const MAX_NAMESERVERS: usize = 3;
+
+/// Finds the nameservers, IPv4 and IPv6 alike, and the last search list, in
+/// text in the `resolv.conf` format. Returns an error if there’s a problem
+/// reading it, or if it specifies no usable nameserver. Only IPv4 ones used
+/// to be read, which left a host with only IPv6 nameservers with none.
 #[cfg(unix)]
 fn parse_resolv_conf(reader: impl io::BufRead) -> Result<Resolver, ResolverLookupError> {
     let mut nameservers = Vec::new();
@@ -106,10 +113,8 @@ fn parse_resolv_conf(reader: impl io::BufRead) -> Result<Resolver, ResolverLooku
         let line = line?;
 
         if let Some(nameserver_str) = line.strip_prefix("nameserver ") {
-            let ip: Result<std::net::Ipv4Addr, _> = nameserver_str.parse();
-            // TODO: This will need to be changed for IPv6 support.
-
-            match ip {
+            let nameserver_str = nameserver_str.trim();
+            match nameserver_str.parse::<std::net::IpAddr>() {
                 Ok(_ip) => nameservers.push(nameserver_str.into()),
                 Err(e)  => warn!("Failed to parse nameserver line {line:?}: {e}"),
             }
@@ -121,12 +126,12 @@ fn parse_resolv_conf(reader: impl io::BufRead) -> Result<Resolver, ResolverLooku
         }
     }
 
-    if let Some(nameserver) = nameservers.into_iter().next() {
-        Ok(Resolver { nameserver, search_list })
+    if nameservers.is_empty() {
+        return Err(ResolverLookupError::NoNameserver);
     }
-    else {
-        Err(ResolverLookupError::NoNameserver)
-    }
+
+    nameservers.truncate(MAX_NAMESERVERS);
+    Ok(Resolver { nameservers, search_list })
 }
 
 
@@ -182,8 +187,8 @@ fn system_nameservers(_paths: &SystemPaths) -> Result<Resolver, ResolverLookupEr
         .and_then(|a| a.dns_servers().first())
     {
         debug!("Found first nameserver {:?}", dns_server);
-        let nameserver = dns_server.to_string();
-        Ok(Resolver { nameserver, search_list })
+        let nameservers = vec![ dns_server.to_string() ];
+        Ok(Resolver { nameservers, search_list })
     }
 
     // Fallback
@@ -192,8 +197,8 @@ fn system_nameservers(_paths: &SystemPaths) -> Result<Resolver, ResolverLookupEr
         .find(|d| (d.is_ipv4() && force_ip_family != ForceIPFamily::V6) || d.is_ipv6())
     {
         debug!("Found first fallback nameserver {:?}", dns_server);
-        let nameserver = dns_server.to_string();
-        Ok(Resolver { nameserver, search_list })
+        let nameservers = vec![ dns_server.to_string() ];
+        Ok(Resolver { nameservers, search_list })
     }
 
     else {
@@ -292,7 +297,7 @@ mod test {
         #[test]
         fn docker_resolv_conf() {
             let resolver = resolv_conf("resolv.conf.docker").unwrap();
-            assert_eq!(resolver.nameserver(), "192.0.2.53");
+            assert_eq!(resolver.nameservers(), [ "192.0.2.53" ]);
             assert_eq!(resolver.search_list, [ "corp.example.", "example.org." ]);
         }
 
@@ -300,22 +305,40 @@ mod test {
         #[test]
         fn debian_resolv_conf() {
             let resolver = resolv_conf("resolv.conf.debian").unwrap();
-            assert_eq!(resolver.nameserver(), "192.0.2.53");
+            assert_eq!(resolver.nameservers(), [ "192.0.2.53" ]);
         }
 
-        /// IPv6 nameservers are skipped, so the first IPv4 one is used.
+        /// Every nameserver is used, in order, IPv6 ones too; before, only
+        /// the first IPv4 one was, so dog never tried another.
         #[test]
         fn networkmanager_resolv_conf() {
             let resolver = resolv_conf("resolv.conf.networkmanager").unwrap();
-            assert_eq!(resolver.nameserver(), "192.0.2.1");
+            assert_eq!(resolver.nameservers(), [ "2001:db8::1", "192.0.2.1", "192.0.2.2" ]);
             assert_eq!(resolver.search_list, [ "example.org" ]);
         }
 
         #[test]
         fn systemd_resolved_stub() {
             let resolver = resolv_conf("resolv.conf.systemd-resolved").unwrap();
-            assert_eq!(resolver.nameserver(), "127.0.0.53");
+            assert_eq!(resolver.nameservers(), [ "127.0.0.53" ]);
             assert_eq!(resolver.search_list, [ "." ]);
+        }
+
+        /// A host with only IPv6 nameservers used to have none as far as dog
+        /// could tell.
+        #[test]
+        fn only_ipv6_nameservers() {
+            let resolver = parse_resolv_conf(&b"nameserver 2001:db8::53\nnameserver ::1 \n"[..]).unwrap();
+            assert_eq!(resolver.nameservers(), [ "2001:db8::53", "::1" ]);
+        }
+
+        /// As with the system’s own resolver, only the first three are used,
+        /// and one that is not an address, such as a scoped link-local one,
+        /// is skipped.
+        #[test]
+        fn at_most_three_nameservers() {
+            let text = "nameserver fe80::1%eth0\nnameserver 192.0.2.1\nnameserver 192.0.2.2\nnameserver 192.0.2.3\nnameserver 192.0.2.4\n";
+            assert_eq!(parse_resolv_conf(text.as_bytes()).unwrap().nameservers(), [ "192.0.2.1", "192.0.2.2", "192.0.2.3" ]);
         }
 
         #[test]
@@ -334,7 +357,7 @@ mod test {
         fn the_last_search_line_wins_and_bad_lines_are_skipped() {
             let text = "search first.example\nnameserver not-an-address\nnameserver 192.0.2.9\nsearch second.example third.example\n";
             let resolver = parse_resolv_conf(text.as_bytes()).unwrap();
-            assert_eq!(resolver.nameserver(), "192.0.2.9");
+            assert_eq!(resolver.nameservers(), [ "192.0.2.9" ]);
             assert_eq!(resolver.search_list, [ "second.example", "third.example" ]);
         }
 
@@ -348,20 +371,20 @@ mod test {
     #[test]
     fn a_specific_nameserver_has_no_search_list() {
         let resolver = ResolverType::Specific("192.0.2.7:5353".into()).obtain(&SystemPaths::system()).unwrap();
-        assert_eq!(resolver.nameserver(), "192.0.2.7:5353");
+        assert_eq!(resolver.nameservers(), [ "192.0.2.7:5353" ]);
         assert!(resolver.search_list.is_empty());
     }
 
     #[test]
     fn names_with_several_labels_are_not_searched() {
-        let resolver = Resolver { nameserver: String::new(), search_list: vec![ "corp.example".into() ] };
+        let resolver = Resolver { nameservers: Vec::new(), search_list: vec![ "corp.example".into() ] };
         assert_eq!(resolver.name_list(&labels("www.example")), [ labels("www.example") ]);
     }
 
     #[test]
     fn single_labels_are_searched_first() {
         let too_long = "a".repeat(300);
-        let resolver = Resolver { nameserver: String::new(), search_list: vec![ "corp.example".into(), too_long, "example.org".into() ] };
+        let resolver = Resolver { nameservers: Vec::new(), search_list: vec![ "corp.example".into(), too_long, "example.org".into() ] };
         assert_eq!(resolver.name_list(&labels("printer")),
                    [ labels("printer.corp.example"), labels("printer.example.org"), labels("printer") ]);
     }

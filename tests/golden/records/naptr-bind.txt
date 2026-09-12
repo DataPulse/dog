@@ -19,7 +19,7 @@ NAPTR naptr.dogtest.example. 1h00m00s   100 10 "S" "SIP+D2U" "" "_sip._udp.dogte
 == dog -U --json -q naptr.dogtest.example -t 35 --class IN
 -- status 0
 -- stdout
-{"responses":[{"flags":{"qr":true,"opcode":"QUERY","aa":true,"tc":false,"rd":true,"ra":false,"ad":false,"cd":false,"rcode":"NOERROR"},"queries":[{"name":"naptr.dogtest.example.","class":"IN","type":"NAPTR"}],"answers":[{"name":"naptr.dogtest.example.","class":"IN","ttl":3600,"type":"NAPTR","data":{"order":102,"flags":"U","service":"E2U+sip","regex":"!^.*$!sip:info@dogtest.example!","replacement":"."}},{"name":"naptr.dogtest.example.","class":"IN","ttl":3600,"type":"NAPTR","data":{"order":100,"flags":"S","service":"SIP+D2U","regex":"","replacement":"_sip._udp.dogtest.example."}}],"authorities":[],"additionals":[]}]}
+{"responses":[{"flags":{"qr":true,"opcode":"QUERY","aa":true,"tc":false,"rd":true,"ra":false,"ad":false,"cd":false,"rcode":"NOERROR"},"queries":[{"name":"naptr.dogtest.example.","class":"IN","type":"NAPTR"}],"answers":[{"name":"naptr.dogtest.example.","class":"IN","ttl":3600,"type":"NAPTR","data":{"order":102,"preference":10,"flags":"U","service":"E2U+sip","regex":"!^.*$!sip:info@dogtest.example!","replacement":"."}},{"name":"naptr.dogtest.example.","class":"IN","ttl":3600,"type":"NAPTR","data":{"order":100,"preference":10,"flags":"S","service":"SIP+D2U","regex":"","replacement":"_sip._udp.dogtest.example."}}],"authorities":[],"additionals":[]}]}
 -- stderr
 == dog -U --edns show --colour=never -q naptr.dogtest.example -t 35 --class IN
 -- status 0

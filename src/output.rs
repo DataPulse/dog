@@ -2,15 +2,15 @@
 
 use std::fmt;
 use std::time::Duration;
-use std::env;
 use std::io::{self, IsTerminal};
 
-use dns::{Response, Query, Answer, QClass, ErrorCode, Flags, Opcode, WireError, MandatedLength};
+use dns::{Response, Query, Answer, Labels, QClass, ErrorCode, Flags, Opcode, WireError, MandatedLength};
 use dns::record::{Record, RecordType, UnknownQtype, OPT};
 use dns_transport::Error as TransportError;
 use serde_json::Value as JsonValue;
 
-use crate::colours::Colours;
+use crate::colours::{self, Colours};
+use crate::stderr;
 use crate::table::{Table, Section};
 
 
@@ -57,7 +57,7 @@ impl UseColours {
     /// overridden the colour setting, and if not, whether output is to a
     /// terminal.
     pub fn should_use_colours(self) -> bool {
-        self == Self::Always || (io::stdout().is_terminal() && env::var("NO_COLOR").is_err() && self != Self::Never)
+        self == Self::Always || (self == Self::Automatic && colours::terminal_wants_colour(io::stdout().is_terminal()))
     }
 
     /// Creates a palette of colours depending on the user’s wishes or whether
@@ -111,7 +111,7 @@ impl OutputFormat {
     pub fn print_error(self, error: TransportError) {
         match self {
             Self::Short(..) | Self::Text(..) => {
-                eprintln!("Error [{}]: {}", erroneous_phase(&error), error_message(error));
+                stderr::line(format_args!("Error [{}]: {}", erroneous_phase(&error), error_message(error)));
             }
 
             Self::JSON => {
@@ -121,7 +121,7 @@ impl OutputFormat {
                     "error_message": error_message(error),
                 });
 
-                eprintln!("{object}");
+                stderr::line(format_args!("{object}"));
             }
         }
     }
@@ -133,7 +133,7 @@ fn print_short(out: &mut impl io::Write, tf: TextFormat, responses: Vec<Response
     let all_answers = responses.into_iter().flat_map(|r| r.answers).collect::<Vec<_>>();
 
     if all_answers.is_empty() {
-        eprintln!("No results");
+        stderr::line(format_args!("No results"));
         return Ok(false);
     }
 
@@ -231,23 +231,23 @@ impl TextFormat {
             Record::A(a)                 => a.address.to_string(),
             Record::AAAA(aaaa)           => aaaa.address.to_string(),
             Record::CAA(caa)             => Self::caa_summary(&caa),
-            Record::CNAME(cname)         => format!("{:?}", cname.domain.to_string()),
+            Record::CNAME(cname)         => quoted(&cname.domain),
             Record::DNSKEY(dnskey)       => format!("{} {} {} {}", dnskey.flags, dnskey.protocol, dnskey.algorithm, dnskey.base64_public_key()),
             Record::DS(ds)               => format!("{} {} {} {}", ds.key_tag, ds.algorithm, ds.digest_type, ds.hex_digest()),
             Record::EUI48(eui48)         => format!("{:?}", eui48.formatted_address()),
             Record::EUI64(eui64)         => format!("{:?}", eui64.formatted_address()),
             Record::HINFO(hinfo)         => format!("{} {}", Ascii(&hinfo.cpu), Ascii(&hinfo.os)),
             Record::LOC(loc)             => Self::loc_summary(&loc),
-            Record::MX(mx)               => format!("{} {:?}", mx.preference, mx.exchange.to_string()),
+            Record::MX(mx)               => format!("{} {}", mx.preference, quoted(&mx.exchange)),
             Record::NAPTR(naptr)         => Self::naptr_summary(&naptr),
-            Record::NS(ns)               => format!("{:?}", ns.nameserver.to_string()),
-            Record::NSEC(nsec)           => format!("{:?} {}", nsec.next_domain.to_string(), nsec.type_names().join(" ")),
+            Record::NS(ns)               => quoted(&ns.nameserver),
+            Record::NSEC(nsec)           => format!("{} {}", quoted(&nsec.next_domain), nsec.type_names().join(" ")),
             Record::OPENPGPKEY(opgp)     => format!("{:?}", opgp.base64_key()),
-            Record::PTR(ptr)             => format!("{:?}", ptr.cname.to_string()),
+            Record::PTR(ptr)             => quoted(&ptr.cname),
             Record::RRSIG(rrsig)         => Self::rrsig_summary(&rrsig),
             Record::SSHFP(sshfp)         => format!("{} {} {}", sshfp.algorithm, sshfp.fingerprint_type, sshfp.hex_fingerprint()),
             Record::SOA(soa)             => self.soa_summary(&soa),
-            Record::SRV(srv)             => format!("{} {} {:?}:{}", srv.priority, srv.weight, srv.target.to_string(), srv.port),
+            Record::SRV(srv)             => format!("{} {} {}:{}", srv.priority, srv.weight, quoted(&srv.target), srv.port),
             Record::TLSA(tlsa)           => format!("{} {} {} {:?}", tlsa.certificate_usage, tlsa.selector, tlsa.matching_type, tlsa.hex_certificate_data()),
             Record::TXT(txt)             => txt.messages.iter().map(|t| Ascii(t).to_string()).collect::<Vec<_>>().join(", "),
             Record::URI(uri)             => format!("{} {} {}", uri.priority, uri.weight, Ascii(&uri.target)),
@@ -272,30 +272,30 @@ impl TextFormat {
     }
 
     fn naptr_summary(naptr: &dns::record::NAPTR) -> String {
-        format!("{} {} {} {} {} {:?}",
+        format!("{} {} {} {} {} {}",
             naptr.order,
             naptr.preference,
             Ascii(&naptr.flags),
             Ascii(&naptr.service),
             Ascii(&naptr.regex),
-            naptr.replacement.to_string(),
+            quoted(&naptr.replacement),
         )
     }
 
     fn rrsig_summary(rrsig: &dns::record::RRSIG) -> String {
-        format!("{} {} {} {:?} {}",
+        format!("{} {} {} {} {}",
             rrsig.type_covered_name().unwrap_or("?"),
             rrsig.algorithm,
             rrsig.key_tag,
-            rrsig.signer_name.to_string(),
+            quoted(&rrsig.signer_name),
             rrsig.base64_signature(),
         )
     }
 
     fn soa_summary(self, soa: &dns::record::SOA) -> String {
-        format!("{:?} {:?} {} {} {} {} {}",
-            soa.mname.to_string(),
-            soa.rname.to_string(),
+        format!("{} {} {} {} {} {} {}",
+            quoted(&soa.mname),
+            quoted(&soa.rname),
             soa.serial,
             self.format_duration(soa.refresh_interval),
             self.format_duration(soa.retry_interval),
@@ -325,6 +325,13 @@ impl TextFormat {
             format!("{seconds}")
         }
     }
+}
+
+/// A name in quotes. The name escapes anything that is not printable, and
+/// any quote or backslash, itself, so it is written as it is; formatting it
+/// with `{:?}` as before escaped those escapes a second time.
+fn quoted(name: &Labels) -> String {
+    format!("\"{name}\"")
 }
 
 /// Formats a duration as days, hours, minutes, and seconds, skipping leading
@@ -415,7 +422,11 @@ fn json_answer(answer: Answer) -> JsonValue {
             "name": qname.to_string(),
             "type": "OPT",
             "data": {
+                "udp_payload_size": opt.udp_payload_size,
+                "extended_rcode_bits": opt.higher_bits,
                 "version": opt.edns0_version,
+                "flags": opt.flags,
+                "dnssec_ok": opt.flags & 0x8000 != 0,
                 "data": opt.data,
             },
         }),
@@ -564,8 +575,8 @@ fn json_loc(loc: &dns::record::LOC) -> JsonValue {
     serde_json::json!({
         "size": loc.size.to_string(),
         "precision": {
-            "horizontal": loc.horizontal_precision,
-            "vertical": loc.vertical_precision,
+            "horizontal": loc.horizontal_precision.to_string(),
+            "vertical": loc.vertical_precision.to_string(),
         },
         "point": {
             "latitude": loc.latitude.as_ref().map(ToString::to_string),
@@ -578,6 +589,7 @@ fn json_loc(loc: &dns::record::LOC) -> JsonValue {
 fn json_naptr(naptr: &dns::record::NAPTR) -> JsonValue {
     serde_json::json!({
         "order": naptr.order,
+        "preference": naptr.preference,
         "flags": lossy(&naptr.flags),
         "service": lossy(&naptr.service),
         "regex": lossy(&naptr.regex),
@@ -720,9 +732,20 @@ fn error_message(error: TransportError) -> String {
         #[cfg(feature = "with_https")]
         TransportError::HttpError(e)             => e.to_string(),
         #[cfg(feature = "with_https")]
-        TransportError::WrongHttpStatus(t,r)     => format!("Nameserver returned HTTP {} ({})", t, r.unwrap_or_else(|| "No reason".into())),
+        TransportError::WrongHttpStatus(t,r)     => http_status_message(t, r),
         #[cfg(feature = "with_https")]
         TransportError::MalformedHttp(why)       => why,
+    }
+}
+
+/// The message for an HTTP status other than 200, with its reason phrase if
+/// the server sent one. HTTP/2 has no reason phrases, and an HTTP/1.1
+/// server can send an empty one.
+#[cfg(feature = "with_https")]
+fn http_status_message(status: u16, reason: Option<String>) -> String {
+    match reason.filter(|reason| ! reason.is_empty()) {
+        Some(reason) => format!("Nameserver returned HTTP {status} ({reason})"),
+        None         => format!("Nameserver returned HTTP {status}"),
     }
 }
 
@@ -817,7 +840,10 @@ mod test {
 
         #[cfg(feature = "with_https")]
         cases.extend([
-            (TransportError::WrongHttpStatus(404, None), "http", "Nameserver returned HTTP 404 (No reason)".to_owned()),
+            (TransportError::WrongHttpStatus(404, Some("Not Found".into())), "http", "Nameserver returned HTTP 404 (Not Found)".to_owned()),
+            // HTTP/2 has no reason phrases, and HTTP/1.1 can send an empty one.
+            (TransportError::WrongHttpStatus(415, None), "http", "Nameserver returned HTTP 415".to_owned()),
+            (TransportError::WrongHttpStatus(500, Some(String::new())), "http", "Nameserver returned HTTP 500".to_owned()),
             (TransportError::MalformedHttp("The response has no Content-Length".into()), "http", "The response has no Content-Length".to_owned()),
         ]);
 
@@ -1169,6 +1195,8 @@ mod test {
             replacement: Labels::encode(".").unwrap(),
         }));
         assert_eq!(j["order"], 100);
+        // The text summary always had the preference; the JSON left it out.
+        assert_eq!(j["preference"], 10);
         assert_eq!(j["flags"], "u");
         assert_eq!(j["service"], "E2U+sip");
         assert_eq!(j["regex"], "!^.*$!sip:info@example.com!");
@@ -1408,6 +1436,34 @@ mod test {
         assert_eq!(j.as_array().map_or(0, Vec::len), 1);
         assert_eq!(j[0]["type"], "OPT");
         assert_eq!(j[0]["data"]["version"], 0);
+        assert_eq!(j[0]["data"]["dnssec_ok"], false);
+    }
+
+    /// The text showed the payload size and the DO bit; the JSON left out
+    /// everything but the version and the data.
+    #[test]
+    fn json_answers_pseudo_fields() {
+        let opt = OPT { udp_payload_size: 1232, higher_bits: 1, edns0_version: 0, flags: 0x8000, data: vec![ 0, 15 ] };
+        let j = json_answers(vec![ Answer::Pseudo { qname: Labels::root(), opt } ]);
+        assert_eq!(j[0]["data"], serde_json::json!({
+            "udp_payload_size": 1232, "extended_rcode_bits": 1, "version": 0, "flags": 32768, "dnssec_ok": true, "data": [ 0, 15 ],
+        }));
+    }
+
+    /// Names escape themselves, so quoting one must not escape it again, as
+    /// formatting it with `{:?}` did: a backslash became two.
+    #[test]
+    fn names_are_quoted_as_they_are_escaped() {
+        let name = Labels::encode("xn--bcher-kva.example").unwrap();
+        assert_eq!(quoted(&name), "\"xn--bcher-kva.example.\"");
+        assert_eq!(quoted(&Labels::root()), "\".\"");
+
+        let summary = |fixture: &str| {
+            let response = Response::from_bytes(&test_support::fixtures::response(fixture)).unwrap();
+            let record = response.answers.into_iter().find_map(|a| if let Answer::Standard { record, .. } = a { Some(record) } else { None }).unwrap();
+            TextFormat { format_durations: false }.record_payload_summary(record)
+        };
+        assert_eq!(summary("nsec-ietf").split(' ').next(), Some(r#""\000.ietf.org.""#));
     }
 
     #[test]

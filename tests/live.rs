@@ -102,6 +102,15 @@ fn google_over_https() {
     every_record_type("@https://dns.google/dns-query", &[ "--https" ]);
 }
 
+/// Quad9 speaks only HTTP/2, and answered dog’s HTTP/1.1 with “505 HTTP
+/// Version Not Supported” until dog offered HTTP/2.
+#[cfg(feature = "with_https")]
+#[test]
+#[ignore = "uses the internet"]
+fn quad9_over_https() {
+    every_record_type("@https://dns.quad9.net/dns-query", &[ "--https" ]);
+}
+
 /// The JSON output is valid, and holds every answer with the queried type;
 /// a name that does not exist is an NXDOMAIN with no answers.
 #[test]
@@ -202,15 +211,16 @@ fn revoked_certificates_are_not_checked() {
     assert!(run.stderr.starts_with("Error [http]: "), "{}", run.stderr);
 }
 
-/// A DoH server's HTTP error is reported with its status and reason, and a
-/// 200 with an empty body is a malformed DNS packet.
+/// A DoH server's HTTP error is reported with its status, and a 200 with an
+/// empty body is a malformed DNS packet. httpbin chooses HTTP/2 when it is
+/// offered, and HTTP/2 has no reason phrases, so there is only the status.
 #[cfg(feature = "with_https")]
 #[test]
 #[ignore = "uses the internet"]
 fn http_errors_from_a_real_server() {
     let run = dog(&[ "--https", "@https://eu.httpbin.org/status/500", "lookup.dog" ]);
     assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()),
-               (1, "", "Error [http]: Nameserver returned HTTP 500 (INTERNAL SERVER ERROR)\n"));
+               (1, "", "Error [http]: Nameserver returned HTTP 500\n"));
 
     let run = dog(&[ "--https", "@https://eu.httpbin.org/status/200", "lookup.dog" ]);
     assert_eq!((run.status, run.stdout.as_str(), run.stderr.as_str()),

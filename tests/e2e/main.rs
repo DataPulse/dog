@@ -5,9 +5,12 @@
 //! in golden files under `tests/golden/`; see `test_support::golden`.
 
 mod common;
+mod escapes;
 mod exit_codes;
 mod meta;
 mod pipes;
 mod records;
 mod request_shape;
+#[cfg(unix)]
+mod signals;
 mod transports;

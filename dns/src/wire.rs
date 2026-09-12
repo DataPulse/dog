@@ -260,7 +260,11 @@ mod test {
 
 
 impl QClass {
-    fn from_u16(uu: u16) -> Self {
+
+    /// The class with this number, by name if it has one. A class given as
+    /// a number must go through this, or it would not be equal to the same
+    /// class read from a response.
+    pub fn from_u16(uu: u16) -> Self {
         match uu {
             0x0001 => Self::IN,
             0x0003 => Self::CH,

@@ -1,11 +1,12 @@
-use std::net::UdpSocket;
-use std::time::{Duration, Instant};
+use std::io;
+use std::time::Duration;
 
 use log::*;
 
 use dns::{Request, Response};
 use super::{Transport, Error, DEFAULT_TIMEOUT};
 use super::{address, net};
+use super::net::Deadline;
 
 
 /// The **UDP transport**, which sends DNS wire data inside a UDP datagram.
@@ -37,9 +38,11 @@ impl UdpTransport {
 
 impl Transport for UdpTransport {
     fn send(&self, request: &Request) -> Result<Response, Error> {
+        let deadline = Deadline::after(self.timeout);
+
         info!("Opening UDP socket");
         let (host, port) = address::parse_host_port(&self.addr, 53)?;
-        let socket = net::connect_udp(host, port, self.timeout)?;
+        let socket = net::connect_udp(host, port, deadline)?;
         debug!("Opened");
 
         let bytes_to_send = request.to_bytes()?;
@@ -48,39 +51,37 @@ impl Transport for UdpTransport {
         let written_len = socket.send(&bytes_to_send).map_err(|e| net::io_error(e, self.timeout))?;
         debug!("Wrote {written_len} bytes");
 
-        self.receive(&socket, request)
+        receive(request, deadline, |buf, left| {
+            socket.set_read_timeout(Some(left))?;
+            socket.recv(buf)
+        })
     }
 }
 
-impl UdpTransport {
+/// Waits for the answer to the request, skipping any datagram that is not
+/// it, such as a late answer to an earlier query or a forgery, until the
+/// deadline. `recv` reads one datagram, waiting at most the time given.
+/// A wait that is interrupted, as when dog is stopped and continued, goes
+/// on with the time that is left.
+fn receive(request: &Request, deadline: Deadline, mut recv: impl FnMut(&mut [u8], Duration) -> io::Result<usize>) -> Result<Response, Error> {
+    info!("Waiting to receive...");
 
-    /// Waits for the answer to the request, skipping any datagram that is
-    /// not it, such as a late answer to an earlier query or a forgery,
-    /// until the time runs out.
-    fn receive(&self, socket: &UdpSocket, request: &Request) -> Result<Response, Error> {
-        info!("Waiting to receive...");
-        let deadline = Instant::now() + self.timeout;
+    // The largest datagram there can be, since dog lets users advertise
+    // any buffer size up to that.
+    let mut buf = vec![0; 65535];
 
-        // The largest datagram there can be, since dog lets users advertise
-        // any buffer size up to that.
-        let mut buf = vec![0; 65535];
-
-        loop {
-            socket.set_read_timeout(Some(time_left(deadline, self.timeout)?))?;
-            let received_len = socket.recv(&mut buf).map_err(|e| net::io_error(e, self.timeout))?;
-            info!("Received {received_len} bytes of data");
-
-            if let Some(response) = accept(request, &buf[.. received_len])? {
-                return Ok(response);
+    loop {
+        match recv(&mut buf, deadline.left()?) {
+            Ok(received_len) => {
+                info!("Received {received_len} bytes of data");
+                if let Some(response) = accept(request, &buf[.. received_len])? {
+                    return Ok(response);
+                }
             }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => debug!("The wait was interrupted; waiting again"),
+            Err(e) => return Err(net::io_error(e, deadline.timeout())),
         }
     }
-}
-
-/// How long is left until the deadline, or a timeout if it has passed.
-fn time_left(deadline: Instant, timeout: Duration) -> Result<Duration, Error> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() { Err(Error::Timeout(timeout)) } else { Ok(left) }
 }
 
 /// What to make of one datagram: the answer; `None` if it does not answer
@@ -143,9 +144,43 @@ mod test {
         assert!(accept(&a_example(), &[ 0x12 ]).unwrap().is_none());
     }
 
+    /// Plays back datagrams, or errors, one per wait, recording how long each
+    /// wait was allowed to take.
+    fn scripted(results: Vec<io::Result<Vec<u8>>>, waits: &mut Vec<Duration>) -> impl FnMut(&mut [u8], Duration) -> io::Result<usize> + '_ {
+        let mut results = results.into_iter();
+        move |buf, left| {
+            waits.push(left);
+            let datagram = results.next().expect("a scripted datagram")?;
+            buf[.. datagram.len()].copy_from_slice(&datagram);
+            Ok(datagram.len())
+        }
+    }
+
+    /// Stopping dog with ^Z and continuing it interrupts the wait; before,
+    /// that ended the query with “Interrupted system call”.
     #[test]
-    fn deadlines() {
-        assert!(time_left(Instant::now() + SHORT, SHORT).unwrap() <= SHORT);
-        assert!(matches!(time_left(Instant::now(), SHORT), Err(Error::Timeout(SHORT))));
+    fn an_interrupted_wait_goes_on_with_the_time_left() {
+        let answer = wire::with_txid(&fixtures::response("a-example"), 0x1234);
+        let noise = wire::with_txid(&answer, 0x4321);
+        let mut waits = Vec::new();
+        let results = vec![ Err(io::ErrorKind::Interrupted.into()), Ok(noise), Err(io::ErrorKind::Interrupted.into()), Ok(answer) ];
+
+        let response = receive(&a_example(), Deadline::after(SHORT), scripted(results, &mut waits)).unwrap();
+        assert_eq!(response.answers.len(), 1);
+        assert_eq!(waits.len(), 4);
+        assert!(waits.windows(2).all(|pair| pair[1] <= pair[0] && pair[0] <= SHORT), "{waits:?}");
+    }
+
+    #[test]
+    fn waits_that_fail() {
+        let mut waits = Vec::new();
+        let timed_out = receive(&a_example(), Deadline::after(SHORT), scripted(vec![ Err(io::ErrorKind::WouldBlock.into()) ], &mut waits));
+        assert!(matches!(timed_out, Err(Error::Timeout(SHORT))), "{timed_out:?}");
+
+        let refused = receive(&a_example(), Deadline::after(SHORT), scripted(vec![ Err(io::ErrorKind::ConnectionRefused.into()) ], &mut waits));
+        assert!(matches!(refused, Err(Error::NetworkError(_))), "{refused:?}");
+
+        let expired = receive(&a_example(), Deadline::after(Duration::ZERO), scripted(Vec::new(), &mut waits));
+        assert!(matches!(expired, Err(Error::Timeout(_))), "{expired:?}");
     }
 }

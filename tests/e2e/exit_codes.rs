@@ -71,6 +71,7 @@ fn a_network_error_in_short_mode_exits_2() {
 #[test]
 fn invalid_options_exit_3() {
     let long_label = "a".repeat(256);
+    let name_too_long = [ "a".repeat(63).as_str(); 4 ].join(".");
     let mut cases: Vec<(&str, Vec<&str>)> = vec![
         ("unknown-flag", vec![ "--wibble" ]),
         ("missing-argument", vec![ "example.com", "--txid" ]),
@@ -84,9 +85,16 @@ fn invalid_options_exit_3() {
         ("invalid-type", vec![ "-t", "WIBBLE", "example.com" ]),
         ("invalid-class", vec![ "--class", "ZZ", "example.com" ]),
         ("label-too-long", vec![ long_label.as_str() ]),
+        ("empty-label", vec![ "a..b" ]),
+        ("empty-domain", vec![ "" ]),
+        ("name-too-long", vec![ name_too_long.as_str() ]),
+        ("control-character", vec![ "\x1b[31mred.example" ]),
+        ("unknown-colour", vec![ "--colour=sometimes", "example.com" ]),
+        ("tweak-needs-edns", vec![ "-Z", "do", "--edns", "disable", "example.com" ]),
     ];
     if cfg!(feature = "with_https") {
         cases.push(("https-without-url", vec![ "--https", "example.com" ]));
+        cases.push(("https-url-line-break", vec![ "--https", "example.com", "@https://localhost/x\r\nX-Evil: 1" ]));
     }
 
     for (name, args) in cases {
@@ -94,6 +102,31 @@ fn invalid_options_exit_3() {
         assert_eq!(run.status, 3, "{name}: {run:?}");
         golden::assert_golden(&format!("exit/{name}"), "txt", &run.transcript());
     }
+}
+
+/// When standard error could not be written to, dog panicked trying, which
+/// aborted it, whatever it had been about to report. Now it exits as it
+/// would have done.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unwritable_standard_error_keeps_the_status() {
+    use std::fs::OpenOptions;
+    use std::process::{Command, Stdio};
+
+    let status = |command: &mut Command| {
+        let full = OpenOptions::new().write(true).open("/dev/full").expect("open /dev/full");
+        command.stdout(Stdio::null()).stderr(full).status().expect("run dog").code().expect("dog exited with a status, not a signal")
+    };
+
+    assert_eq!(status(dog().arg("--wibble")), 3);
+    assert_eq!(status(dog().arg("a..b")), 3);
+
+    let closed = mock::tcp(Tcp::CloseImmediately);
+    assert_eq!(status(dog().args([ "-T", "a-example.lookup.dog" ]).arg(closed.at())), 1);
+
+    let nxdomain = mock::udp(Udp::Replay(fixtures::response("nxdomain")));
+    assert_eq!(status(dog().args([ "-U", "--short", "non.existent" ]).arg(nxdomain.at())), 2);
+    assert_eq!(status(dog().env("DOG_DEBUG", "trace").args([ "-U", "--short", "non.existent" ]).arg(nxdomain.at())), 2);
 }
 
 #[test]

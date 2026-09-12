@@ -6,17 +6,18 @@ use log::*;
 use dns::{Request, Response};
 use super::{Transport, Error, DEFAULT_TIMEOUT};
 use super::address::{self, HttpsUrl};
-use super::{net, tls_stream};
+use super::{h2, net, tls_stream};
+use super::net::Deadline;
 
 
 /// The most of an HTTP response’s head that dog will read.
 const MAX_HEAD: usize = 8 * 1024;
 
 /// The longest body dog will read: the longest a DNS message can be.
-const MAX_BODY: usize = 65_535;
+pub(crate) const MAX_BODY: usize = 65_535;
 
 /// The User-Agent header sent with HTTPS requests.
-static USER_AGENT: &str = concat!("dog/", env!("CARGO_PKG_VERSION"));
+pub(crate) static USER_AGENT: &str = concat!("dog/", env!("CARGO_PKG_VERSION"));
 
 
 /// The **HTTPS transport**, which sends DNS wire data inside HTTP packets
@@ -40,7 +41,7 @@ impl HttpsTransport {
     }
 
     /// Creates a new HTTPS transport that connects to the given URL, and
-    /// waits at most `timeout` for it to connect, and again to answer.
+    /// gives up if the whole exchange has not finished within `timeout`.
     pub fn with_timeout(url: String, timeout: Duration) -> Self {
         Self { url, timeout }
     }
@@ -48,14 +49,29 @@ impl HttpsTransport {
 
 impl Transport for HttpsTransport {
     fn send(&self, request: &Request) -> Result<Response, Error> {
+        let deadline = Deadline::after(self.timeout);
         let url = address::parse_https_url(&self.url)?;
 
         info!("Opening TLS socket to {:?}", url.host);
-        let mut stream = tls_stream::connect(url.host, url.port, self.timeout)?;
+        let mut stream = tls_stream::connect(url.host, url.port, deadline, &[ "h2", "http/1.1" ])?;
         debug!("Connected");
 
-        exchange_https(&mut stream, &url, request, self.timeout)
+        if speaks_http2(&stream) {
+            info!("The server chose HTTP/2");
+            h2::exchange(&mut stream, &url, request, self.timeout)
+        }
+        else {
+            exchange_https(&mut stream, &url, request, self.timeout)
+        }
     }
+}
+
+/// Whether the server chose HTTP/2 when the connection was made (ALPN, RFC
+/// 7301). A server that chose nothing gets HTTP/1.1.
+fn speaks_http2(stream: &tls_stream::Stream) -> bool {
+    stream.negotiated_alpn()
+        .inspect_err(|e| warn!("Could not tell which protocol the server chose: {e}"))
+        .ok().flatten().as_deref() == Some(b"h2")
 }
 
 
@@ -92,7 +108,7 @@ pub(crate) fn build_http_request(url: &HttpsUrl<'_>, body: &[u8]) -> Vec<u8> {
 
 /// The value of the Host header: the host, in brackets if it is an IPv6
 /// address, and its port if that isn’t the default (RFC 9110 §7.2).
-fn host_header(url: &HttpsUrl<'_>) -> String {
+pub(crate) fn host_header(url: &HttpsUrl<'_>) -> String {
     let host = if url.host.contains(':') { format!("[{}]", url.host) } else { url.host.to_owned() };
     if url.port == 443 { host } else { format!("{host}:{}", url.port) }
 }
@@ -196,7 +212,7 @@ fn header<'a>(headers: &[httparse::Header<'a>], name: &str) -> Option<&'a [u8]> 
 mod test {
     use super::*;
     use std::io::Cursor;
-    use std::net::TcpStream;
+    use std::time::Instant;
     use crate::test_util::{a_example, SHORT};
     use test_support::{fixtures, mock::{self, Http}, wire};
 
@@ -364,13 +380,26 @@ mod test {
         assert_eq!(host("::1", 8443), "[::1]:8443");
     }
 
-    fn exchange_with(mode: Http) -> (Result<Response, Error>, Vec<Vec<u8>>) {
+    fn exchange_within(mode: Http, deadline: Deadline) -> (Result<Response, Error>, Vec<Vec<u8>>) {
         let server = mock::http(mode);
-        let mut stream = TcpStream::connect(server.addr()).unwrap();
-        stream.set_read_timeout(Some(SHORT * 10)).unwrap();
+        let mut stream = net::connect_tcp("127.0.0.1", server.port(), deadline).unwrap();
         let url = HttpsUrl { host: "127.0.0.1", port: server.port(), path: "/dns-query" };
         let result = exchange_https(&mut stream, &url, &a_example(), SHORT);
         (result, server.requests())
+    }
+
+    fn exchange_with(mode: Http) -> (Result<Response, Error>, Vec<Vec<u8>>) {
+        exchange_within(mode, Deadline::after(SHORT * 10))
+    }
+
+    /// A server that sent its response a byte at a time, each well within
+    /// the timeout, used to hold dog for as long as it kept sending.
+    #[test]
+    fn a_response_trickled_out_a_byte_at_a_time() {
+        let started = Instant::now();
+        let (result, _) = exchange_within(Http::Trickle(fixtures::http_response("doh-google"), SHORT / 3), Deadline::after(SHORT));
+        assert!(matches!(result, Err(Error::Timeout(SHORT))), "{result:?}");
+        assert!(started.elapsed() < SHORT * 3, "{:?}", started.elapsed());
     }
 
     #[test]

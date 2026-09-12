@@ -53,6 +53,18 @@ pub fn http_request(name: &str) -> Vec<u8> {
     load(&format!("doh/{name}.request.http"))
 }
 
+/// Every byte the server sent for the named DNS-over-HTTPS scenario over
+/// HTTP/2, up to the frame that ended the response.
+pub fn h2_response(name: &str) -> Vec<u8> {
+    load(&format!("doh/{name}.response.h2"))
+}
+
+/// The raw HTTP/2 request that was sent for the named DNS-over-HTTPS
+/// scenario, from the connection preface to the end of the body.
+pub fn h2_request(name: &str) -> Vec<u8> {
+    load(&format!("doh/{name}.request.h2"))
+}
+
 /// One row of `tests/fixtures/MANIFEST.tsv`, describing how a fixture was captured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -69,9 +81,10 @@ pub struct Row {
 }
 
 impl Row {
-    /// Whether the scenario went over plain DNS (UDP or TCP) rather than HTTPS.
+    /// Whether the scenario went over plain DNS (UDP or TCP) rather than
+    /// HTTPS, over either HTTP/1.1 (`doh`) or HTTP/2 (`doh2`).
     pub fn is_dns(&self) -> bool {
-        self.transport != "doh"
+        ! self.transport.starts_with("doh")
     }
 
     /// The value of one `key=value` knob, such as `do` or `bufsize`.

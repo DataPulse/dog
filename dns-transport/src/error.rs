@@ -32,7 +32,7 @@ pub enum Error {
 
     /// There was a problem _establishing_ a TLS request.
     #[cfg(any(feature = "with_tls", feature = "with_https"))]
-    TlsHandshakeError(native_tls::HandshakeError<std::net::TcpStream>),
+    TlsHandshakeError(native_tls::Error),
 
     /// There was a problem decoding the response HTTP headers or body.
     #[cfg(feature = "with_https")]

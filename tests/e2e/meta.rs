@@ -62,17 +62,20 @@ fn no_color_turns_off_automatic_colour_only() {
     assert!(forced.stdout.contains("\x1b[1;32mA\x1b[0m"), "{forced:?}");
 }
 
+/// The log goes to standard error, and when that is not a terminal, as
+/// here, it has no escape codes in it; before, it always had.
 #[test]
 fn debug_logging_goes_to_stderr() {
     let server = mock::udp(Udp::Replay(fixtures::response("a-example")));
 
     let trace = Run::of(dog().env("DOG_DEBUG", "trace").args([ "-U", "--short", "a-example.lookup.dog" ]).arg(server.at()));
     assert_eq!((trace.status, trace.stdout.as_str()), (0, "10.20.30.40\n"));
-    assert!(trace.stderr.contains("\x1b[38;5;245mTRACE\x1b[0m"), "{}", trace.stderr);
-    assert!(trace.stderr.contains("\x1b[36mINFO\x1b[0m"), "{}", trace.stderr);
+    assert!(trace.stderr.lines().any(|line| line.starts_with("[TRACE dns::")), "{}", trace.stderr);
+    assert!(trace.stderr.lines().any(|line| line.starts_with("[INFO dns_transport::")), "{}", trace.stderr);
+    assert!(!trace.stderr.contains('\x1b'), "{}", trace.stderr);
 
     let debug = Run::of(dog().env("DOG_DEBUG", "1").args([ "-U", "--short", "a-example.lookup.dog" ]).arg(server.at()));
-    assert!(debug.stderr.contains("\x1b[34mDEBUG\x1b[0m"), "{}", debug.stderr);
+    assert!(debug.stderr.lines().any(|line| line.starts_with("[DEBUG ")), "{}", debug.stderr);
     assert!(!debug.stderr.contains("TRACE"), "{}", debug.stderr);
 
     let empty = Run::of(dog().env("DOG_DEBUG", "").args([ "-U", "--short", "a-example.lookup.dog" ]).arg(server.at()));

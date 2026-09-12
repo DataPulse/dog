@@ -29,5 +29,7 @@ test-support = { workspace = true, features = ["tls"] }
 [features]
 default = []  # these are enabled in the main dog crate
 
-with_tls   = ["dep:native-tls"]
-with_https = ["dep:native-tls", "dep:httparse"]
+# ALPN lets a DNS-over-HTTPS server choose HTTP/2; on Linux it needs
+# nothing beyond the system OpenSSL
+with_tls   = ["dep:native-tls", "native-tls/alpn"]
+with_https = ["dep:native-tls", "native-tls/alpn", "dep:httparse"]

@@ -22,7 +22,7 @@ Query options:
 Sending options:
   --edns=SETTING           Whether to OPT in to EDNS (disable, hide, show)
   --txid=NUMBER            Set the transaction ID to a specific value
-  -Z=TWEAKS                Set uncommon protocol-level tweaks
+  -Z TWEAK                 Set a protocol tweak (aa, ad, cd, do, bufsize=NUM)
 
 Protocol options:
   -U, --udp                Use the DNS protocol over UDP
@@ -31,7 +31,7 @@ Protocol options:
   -H, --https              Use the DNS-over-HTTPS protocol
 
 Output options:
-  -1, --short              Short mode: display nothing but the first result
+  -1, --short              Short mode: display nothing but the answers
   -J, --json               Display the output as JSON
   --color, --colour=WHEN   When to colourise the output (always, automatic, never)
   --seconds                Do not format durations, display them as seconds

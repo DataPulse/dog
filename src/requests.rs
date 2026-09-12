@@ -113,8 +113,7 @@ impl RequestGenerator {
                                 additional = Some(opt);
                             }
 
-                            let nameserver = resolver.nameserver();
-                            let transport = transport_type.make_transport(nameserver);
+                            let transport = transport_type.make_transport_to(resolver.nameservers());
 
                             let mut request_list = Vec::new();
                             for qname in resolver.name_list(domain) {

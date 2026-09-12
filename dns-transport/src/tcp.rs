@@ -6,6 +6,7 @@ use log::*;
 use dns::{Request, Response};
 use super::{Transport, Error, DEFAULT_TIMEOUT};
 use super::{address, net};
+use super::net::Deadline;
 
 
 /// The **TCP transport**, which sends DNS wire data over a TCP stream.
@@ -30,7 +31,7 @@ impl TcpTransport {
     }
 
     /// Creates a new TCP transport that connects to the given host, and
-    /// waits at most `timeout` for it to connect, and again to answer.
+    /// gives up if the whole exchange has not finished within `timeout`.
     pub fn with_timeout(addr: String, timeout: Duration) -> Self {
         Self { addr, timeout }
     }
@@ -39,9 +40,11 @@ impl TcpTransport {
 
 impl Transport for TcpTransport {
     fn send(&self, request: &Request) -> Result<Response, Error> {
+        let deadline = Deadline::after(self.timeout);
+
         info!("Opening TCP stream");
         let (host, port) = address::parse_host_port(&self.addr, 53)?;
-        let mut stream = net::connect_tcp(host, port, self.timeout)?;
+        let mut stream = net::connect_tcp(host, port, deadline)?;
         debug!("Opened");
 
         info!("Sending a request to {:?} over TCP", self.addr);
@@ -96,7 +99,7 @@ pub(crate) fn length_prefixed_read(stream: &mut impl Read, timeout: Duration) ->
 
 /// Fills the buffer, however many reads that takes. An early end of the
 /// stream means the response was cut short.
-fn read_fully(stream: &mut impl Read, buf: &mut [u8], timeout: Duration) -> Result<(), Error> {
+pub(crate) fn read_fully(stream: &mut impl Read, buf: &mut [u8], timeout: Duration) -> Result<(), Error> {
     stream.read_exact(buf).map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
             warn!("The connection closed before the whole response arrived");
