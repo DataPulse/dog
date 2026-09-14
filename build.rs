@@ -36,7 +36,7 @@ fn main() -> io::Result<()> {
     let build = Build { profile: &profile, version: &pkg_version, missing_features: &missing };
 
     let (git_hash, date) =
-        if version::needs_provenance(&build) { (git_hash(), build_date()) }
+        if version::needs_provenance(&build) { watch_git_head()?; (git_hash(), build_date()) }
         else { (String::new(), String::new()) };
     let ver = version::version_text(&build, &Provenance { git_hash: &git_hash, date: &date });
 
@@ -61,6 +61,25 @@ fn cargo_env(name: &str) -> io::Result<String> {
 /// Finds whether a feature is enabled by examining the Cargo variable.
 fn feature_enabled(name: &str) -> bool {
     env::var(format!("CARGO_FEATURE_{name}")).is_ok_and(|value| !value.is_empty())
+}
+
+/// Asks Cargo to run this script again whenever `HEAD` moves to another
+/// commit. Without this, a commit that changed no source file left the
+/// version showing the commit before it. Only files that exist are named,
+/// because Cargo would run the script on every build for one that did not,
+/// as in a source tree without Git, such as the one Docker builds from.
+fn watch_git_head() -> io::Result<()> {
+    let git = PathBuf::from(cargo_env("CARGO_MANIFEST_DIR")?).join(".git");
+    let Ok(head) = fs::read_to_string(git.join("HEAD")) else { return Ok(()) };
+
+    for file in version::git_head_files(&head) {
+        let path = git.join(file);
+        if path.exists() {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
+    }
+
+    Ok(())
 }
 
 /// The project’s current Git hash, or `unknown` when building from a

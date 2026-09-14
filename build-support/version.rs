@@ -71,6 +71,19 @@ pub fn needs_provenance(build: &Build<'_>) -> bool {
     build.profile != "debug" && build.version.ends_with("-pre")
 }
 
+/// The files in the `.git` directory whose change means `HEAD` is now at a
+/// different commit, given what `HEAD` contains: `HEAD` itself, and when it
+/// names a branch, that branch’s ref, and the packed refs, where Git keeps
+/// the ref instead once it has packed them.
+pub fn git_head_files(head: &str) -> Vec<String> {
+    let mut files = vec![ "HEAD".to_owned() ];
+    if let Some(reference) = head.trim().strip_prefix("ref: ") {
+        files.push(reference.to_owned());
+        files.push("packed-refs".to_owned());
+    }
+    files
+}
+
 /// The version text, with colour codes still marked by backslashes.
 /// `provenance` is only used when [`needs_provenance`] says so.
 pub fn version_text(build: &Build<'_>, provenance: &Provenance<'_>) -> String {

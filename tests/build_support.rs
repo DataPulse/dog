@@ -68,3 +68,11 @@ fn utc_dates() {
     assert_eq!(version::utc_date(1_767_225_600), "2026-01-01");
     assert_eq!(version::utc_date(4_102_444_800), "2100-01-01");
 }
+
+/// A commit that changed no source file used to leave the version showing
+/// the commit before it, because nothing told Cargo that `HEAD` had moved.
+#[test]
+fn the_files_that_say_which_commit_is_checked_out() {
+    assert_eq!(version::git_head_files("ref: refs/heads/modernization\n"), [ "HEAD", "refs/heads/modernization", "packed-refs" ]);
+    assert_eq!(version::git_head_files("4aaf36c48ade9386c67aaa206e90d42f359d934a\n"), [ "HEAD" ]);
+}
