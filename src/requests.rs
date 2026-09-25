@@ -1,5 +1,7 @@
 //! Request generation based on the user’s input arguments.
 
+use std::time::Duration;
+
 use crate::connect::TransportType;
 use crate::resolve::{ResolverType, ResolverLookupError};
 use crate::txid::TxidGenerator;
@@ -21,6 +23,9 @@ pub struct RequestGenerator {
 
     /// Other weird protocol options.
     pub protocol_tweaks: ProtocolTweaks,
+
+    /// How long each transport waits for a nameserver before giving up.
+    pub timeout: Duration,
 }
 
 /// Which things the user has specified they want queried.
@@ -113,7 +118,7 @@ impl RequestGenerator {
                                 additional = Some(opt);
                             }
 
-                            let transport = transport_type.make_transport_to(resolver.nameservers());
+                            let transport = transport_type.make_transport_to(resolver.nameservers(), self.timeout);
 
                             let mut request_list = Vec::new();
                             for qname in resolver.name_list(domain) {

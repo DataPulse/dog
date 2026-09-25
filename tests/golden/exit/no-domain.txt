@@ -22,6 +22,7 @@ Query options:
 Sending options:
   --edns=SETTING           Whether to OPT in to EDNS (disable, hide, show)
   --txid=NUMBER            Set the transaction ID to a specific value
+  --timeout=SECONDS        How long to wait for each answer, in seconds (default 5)
   -Z TWEAK                 Set a protocol tweak (aa, ad, cd, do, bufsize=NUM)
 
 Protocol options:

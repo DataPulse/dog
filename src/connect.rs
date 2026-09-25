@@ -1,5 +1,7 @@
 //! Creating DNS transports based on the user’s input arguments.
 
+use std::time::Duration;
+
 use dns_transport::*;
 
 
@@ -38,27 +40,28 @@ impl TransportType {
 
     /// Creates a boxed `Transport` depending on the transport type. The
     /// parameter will be a URL for the HTTPS transport type, and a
-    /// stringified address for the others.
-    pub fn make_transport(self, param: String) -> Box<dyn Transport> {
+    /// stringified address for the others. It waits up to `timeout` for the
+    /// nameserver, first to accept a connection and then to answer.
+    pub fn make_transport(self, param: String, timeout: Duration) -> Box<dyn Transport> {
         match self {
-            Self::Automatic  => Box::new(AutoTransport::new(param)),
-            Self::UDP        => Box::new(UdpTransport::new(param)),
-            Self::TCP        => Box::new(TcpTransport::new(param)),
+            Self::Automatic  => Box::new(AutoTransport::with_timeout(param, timeout)),
+            Self::UDP        => Box::new(UdpTransport::with_timeout(param, timeout)),
+            Self::TCP        => Box::new(TcpTransport::with_timeout(param, timeout)),
             #[cfg(feature = "with_tls")]
-            Self::TLS        => Box::new(TlsTransport::new(param)),
+            Self::TLS        => Box::new(TlsTransport::with_timeout(param, timeout)),
             #[cfg(feature = "with_https")]
-            Self::HTTPS      => Box::new(HttpsTransport::new(param)),
+            Self::HTTPS      => Box::new(HttpsTransport::with_timeout(param, timeout)),
         }
     }
 
     /// Creates a transport that sends to the first of the nameservers, and
-    /// on to the next whenever one fails to answer.
-    pub fn make_transport_to(self, nameservers: &[String]) -> Box<dyn Transport> {
+    /// on to the next whenever one fails to answer, each within `timeout`.
+    pub fn make_transport_to(self, nameservers: &[String], timeout: Duration) -> Box<dyn Transport> {
         if let [ nameserver ] = nameservers {
-            return self.make_transport(nameserver.clone());
+            return self.make_transport(nameserver.clone(), timeout);
         }
 
-        Box::new(FailoverTransport::new(nameservers.iter().map(|nameserver| self.make_transport(nameserver.clone())).collect()))
+        Box::new(FailoverTransport::new(nameservers.iter().map(|nameserver| self.make_transport(nameserver.clone(), timeout)).collect()))
     }
 
     /// Checks that a nameserver given on the command line can be used with
@@ -105,14 +108,14 @@ mod test {
     #[test]
     fn nameservers_are_tried_in_turn() {
         let working = mock::udp(Udp::Replay(fixtures::response("a-example")));
-        let transport = TransportType::UDP.make_transport_to(&[ closed_port(), working.addr().to_string() ]);
+        let transport = TransportType::UDP.make_transport_to(&[ closed_port(), working.addr().to_string() ], DEFAULT_TIMEOUT);
         assert_eq!(transport.send(&a_example()).unwrap().answers.len(), 1);
         assert_eq!(working.requests().len(), 1);
     }
 
     #[test]
     fn one_nameserver_is_used_alone() {
-        let transport = TransportType::UDP.make_transport_to(&[ closed_port() ]);
+        let transport = TransportType::UDP.make_transport_to(&[ closed_port() ], DEFAULT_TIMEOUT);
         assert!(matches!(transport.send(&a_example()), Err(Error::NetworkError(_))));
     }
 

@@ -77,6 +77,9 @@ SENDING OPTIONS
 `--txid=NUMBER`
 : Set the transaction ID to a specific value, in decimal, or in hexadecimal after ‘`0x`’.
 
+`--timeout=SECONDS`
+: How long to wait for each answer before giving up, in seconds; fractions are allowed, and the most is 3600. The default is 5. Each query dog sends gets this long, so a lookup of several record types can take several times as long in all. When dog asks a recursive resolver, set it above the time that resolver takes to give up, so dog reports the resolver’s answer (SERVFAIL, say) rather than its own timeout.
+
 `-Z TWEAK`
 : Set an uncommon protocol-level tweak. This can be given more than once; see PROTOCOL TWEAKS below.
 

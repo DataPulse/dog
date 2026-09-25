@@ -2,6 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fmt;
+use std::time::Duration;
 
 use log::*;
 
@@ -54,6 +55,7 @@ impl Options {
         // Sending options
         opts.optopt  ("",  "edns",         "Whether to OPT in to EDNS (disable, hide, show)", "SETTING");
         opts.optopt  ("",  "txid",         "Set the transaction ID to a specific value", "NUMBER");
+        opts.optopt  ("",  "timeout",      "How long to wait for each answer, in seconds (default 5)", "SECONDS");
         opts.optmulti("Z", "",             "Set uncommon protocol tweaks", "TWEAKS");
 
         // Protocol options
@@ -123,9 +125,29 @@ impl RequestGenerator {
         let txid_generator = TxidGenerator::deduce(&matches)?;
         let protocol_tweaks = ProtocolTweaks::deduce(&matches)?;
         protocol_tweaks.check_edns(edns)?;
+        let timeout = deduce_timeout(&matches)?;
         let inputs = Inputs::deduce(matches)?;
 
-        Ok(Self { inputs, txid_generator, edns, protocol_tweaks })
+        Ok(Self { inputs, txid_generator, edns, protocol_tweaks, timeout })
+    }
+}
+
+/// The longest `--timeout` accepted: an hour. Anything longer is almost
+/// certainly a mistake, and would leave dog apparently hung.
+const MAX_TIMEOUT_SECONDS: f64 = 3600.0;
+
+/// How long each transport waits for a nameserver: `--timeout` in seconds,
+/// fractions allowed, or the transports' default. A caller that runs its own
+/// recursive resolver sets it above the resolver's give-up time, so dog
+/// reports the resolver's answer (SERVFAIL, say) instead of its own timeout.
+fn deduce_timeout(matches: &getopts::Matches) -> Result<Duration, OptionsError> {
+    let Some(input) = matches.opt_str("timeout") else {
+        return Ok(dns_transport::DEFAULT_TIMEOUT);
+    };
+
+    match input.parse::<f64>() {
+        Ok(seconds) if seconds > 0.0 && seconds <= MAX_TIMEOUT_SECONDS => Ok(Duration::from_secs_f64(seconds)),
+        _ => Err(OptionsError::InvalidTimeout(input)),
     }
 }
 
@@ -594,6 +616,7 @@ pub enum OptionsError {
     InvalidQueryType(String),
     InvalidQueryClass(String),
     InvalidTxid(String),
+    InvalidTimeout(String),
     InvalidTweak(String),
     QueryTypeOPT,
     #[cfg(feature = "with_https")]
@@ -631,6 +654,7 @@ impl fmt::Display for OptionsError {
             Self::InvalidQueryType(qt)   => write!(f, "Invalid query type {qt:?}"),
             Self::InvalidQueryClass(qc)  => write!(f, "Invalid query class {qc:?}"),
             Self::InvalidTxid(txid)      => write!(f, "Invalid transaction ID {txid:?}"),
+            Self::InvalidTimeout(t)      => write!(f, "Invalid timeout {t:?} (seconds, more than 0 and at most 3600)"),
             Self::InvalidTweak(tweak)    => write!(f, "Invalid protocol tweak {tweak:?}"),
             Self::QueryTypeOPT           => write!(f, "OPT request is sent by default (see -Z flag)"),
             #[cfg(feature = "with_https")]
@@ -1103,6 +1127,28 @@ mod test {
         assert_eq!(options.requests.inputs.resolver_types,
                    vec![ ResolverType::Specific("1.1.1.1".into()) ]);
         assert_eq!(options.requests.protocol_tweaks.set_dnssec_ok_flag, true);
+    }
+
+    #[test]
+    fn timeout_defaults_to_the_transports_default() {
+        let options = Options::getopts(&[ "dom.ain" ]).unwrap();
+        assert_eq!(options.requests.timeout, dns_transport::DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn timeout_in_seconds_with_fractions() {
+        let options = Options::getopts(&[ "dom.ain", "--timeout", "15" ]).unwrap();
+        assert_eq!(options.requests.timeout, Duration::from_secs(15));
+        let options = Options::getopts(&[ "dom.ain", "--timeout=0.25" ]).unwrap();
+        assert_eq!(options.requests.timeout, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn timeout_must_be_positive_and_at_most_an_hour() {
+        for bad in [ "0", "-1", "3601", "soon", "", "NaN", "inf" ] {
+            assert_eq!(Options::getopts(&[ "dom.ain", "--timeout", bad ]),
+                       OptionsResult::InvalidOptions(OptionsError::InvalidTimeout(bad.into())), "{bad:?}");
+        }
     }
 
     #[test]

@@ -55,6 +55,32 @@ fn automatic_transport_keeps_untruncated_udp_answers() {
     assert_eq!((udp.requests().len(), tcp.requests().len()), (1, 0));
 }
 
+/// `--timeout` changes how long dog waits: a caller running its own recursive
+/// resolver sets it above the resolver's give-up time, and a short one gives
+/// up sooner. Fractions of a second are allowed.
+#[test]
+fn a_silent_server_times_out_after_the_timeout_asked_for() {
+    let server = mock::udp(Udp::Silent);
+    let started = Instant::now();
+    let run = Run::of(dog().args([ "-U", "--timeout", "1.5", "a-example.lookup.dog" ]).arg(server.at()));
+    let elapsed = started.elapsed();
+
+    assert_eq!((run.status, run.stderr.as_str()), (1, "Error [network]: Timed out after 1.5s waiting for a response\n"));
+    assert!(elapsed >= Duration::from_millis(1400) && elapsed < Duration::from_secs(4), "{elapsed:?}");
+}
+
+/// A `--timeout` longer than the default lets a slow server answer.
+#[test]
+fn a_longer_timeout_waits_past_five_seconds() {
+    let server = mock::udp(Udp::Silent);
+    let started = Instant::now();
+    let run = Run::of(dog().args([ "-U", "--timeout", "7", "a-example.lookup.dog" ]).arg(server.at()));
+    let elapsed = started.elapsed();
+
+    assert_eq!((run.status, run.stderr.as_str()), (1, "Error [network]: Timed out after 7s waiting for a response\n"));
+    assert!(elapsed >= Duration::from_millis(6500) && elapsed < Duration::from_secs(10), "{elapsed:?}");
+}
+
 /// With nothing to say how long to wait, dog gives up on a silent server
 /// after five seconds.
 #[test]
